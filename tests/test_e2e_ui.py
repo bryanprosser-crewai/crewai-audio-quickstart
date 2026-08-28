@@ -73,7 +73,7 @@ def test_mic_recording_pipeline_produces_valid_container(page: Page, ui_url,
                     "audio/x-wav"}, f"unmapped container: {base}"
 
 
-def test_conversation_with_session_chain(page: Page, ui_url, deployment):
+def test_conversation_with_stable_session(page: Page, ui_url, deployment):
     _configure(page, ui_url, deployment)
 
     _send(page, "What is the latest output reading for PUMP A1?")
@@ -88,6 +88,7 @@ def test_conversation_with_session_chain(page: Page, ui_url, deployment):
     expect(second).to_contain_text("kWh")
 
     expect(page.locator(".sess")).not_to_contain_text("(new conversation)")
+    expect(page.locator(".sess")).to_contain_text("session:")
 
 
 def test_footer_shows_build_version(page: Page, ui_url, deployment):
@@ -96,7 +97,7 @@ def test_footer_shows_build_version(page: Page, ui_url, deployment):
         re.compile(r"build v\d+\.\d+\.\d+"))
 
 
-def test_new_conversation_resets_chain(page: Page, ui_url, deployment):
+def test_new_conversation_resets_session(page: Page, ui_url, deployment):
     _configure(page, ui_url, deployment)
     _send(page, "goodbye")
     expect(page.locator(".msg.assistant").last).to_contain_text(

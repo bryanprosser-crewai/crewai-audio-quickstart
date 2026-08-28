@@ -23,11 +23,9 @@ Fill in Settings:
 Then type — or click **🎤 Talk**, speak, click **Stop**. The reply can be
 spoken aloud (checkbox in Settings) via the browser's speech synthesis.
 
-Conversation continuity is a `restoreFromStateId` **chain**: every turn sends
-a fresh UUID and restores the previous turn's state (the footer shows the
-current chain head, advanced only when a turn succeeds — never reuse one id
-across kickoffs). **"New conversation"** clears the chain; keeping it is what
-makes the form wizard work.
+Conversation continuity is a **stable session id**: every turn of a conversation
+sends the same UUID as `inputs.id` (the footer shows it). **"New conversation"**
+mints a fresh id; keeping it is what makes the form wizard work.
 
 ## Cross-origin note
 

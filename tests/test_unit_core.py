@@ -142,18 +142,27 @@ def flow(tmp_path, monkeypatch) -> AssistantFlow:
 
 @pytest.mark.parametrize("message", ["goodbye", "ok QUIT now", "bye!"])
 def test_router_quit_is_deterministic(flow, message):
-    flow.state.message = message
-    assert flow.route() == "END"
+    flow.state.current_user_message = message
+    assert flow.route_turn({}) == "GOODBYE"
 
 
 def test_router_cancel_inside_form(flow):
     flow.state.active_mode = "form"
-    flow.state.message = "cancel that"
-    assert flow.route() == "CANCEL"
+    flow.state.current_user_message = "cancel that"
+    assert flow.route_turn({}) == "CANCEL"
 
 
 def test_router_form_mode_continues(flow):
     flow.state.active_mode = "form"
     flow.state.form_type = "maintenance_report"
-    flow.state.message = "the asset id is PUMP A1"
-    assert flow.route() == "FORM"
+    flow.state.current_user_message = "the asset id is PUMP A1"
+    assert flow.route_turn({}) == "FORM"
+
+
+def test_conversation_start_hydrates_amp_kickoff_message(flow):
+    """AMP /kickoff overlays `message`; handle_turn is not in that path."""
+    flow.state.message = "cancel that"
+    flow.state.active_mode = "form"
+    flow.conversation_start()
+    assert flow.state.current_user_message == "cancel that"
+    assert flow.route_turn({}) == "CANCEL"

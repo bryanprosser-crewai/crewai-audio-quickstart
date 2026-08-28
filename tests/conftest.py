@@ -115,21 +115,19 @@ def _request(url: str, token: str, payload: dict | None = None) -> dict:
         return json.loads(resp.read().decode() or "{}")
 
 
-def run_turn(dep: dict, message: str, turn_id: str | None = None,
-             restore_from: str | None = None, timeout_s: int = 240) -> tuple[str, str]:
-    """One kickoff → poll. Returns (turn_id, result). Fresh UUID per turn +
-    restoreFromStateId chaining — the platform deprecates inputs.id reuse."""
-    turn_id = turn_id or str(uuid.uuid4())
-    body: dict = {"inputs": {"id": turn_id, "message": message}}
-    if restore_from:
-        body["restoreFromStateId"] = restore_from
+def run_turn(dep: dict, message: str, session_id: str | None = None,
+             timeout_s: int = 240) -> tuple[str, str]:
+    """One kickoff → poll. Returns (session_id, result). Reuse the SAME
+    session_id across turns — the conversational Flow contract."""
+    session_id = session_id or str(uuid.uuid4())
+    body: dict = {"inputs": {"id": session_id, "message": message}}
     kid = _request(f"{dep['url']}/kickoff", dep["token"], body)["kickoff_id"]
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         status = _request(f"{dep['url']}/status/{kid}", dep["token"])
         state = str(status.get("state") or status.get("status") or "").upper()
         if state in {"SUCCESS", "SUCCEEDED", "COMPLETED", "COMPLETE", "FINISHED"}:
-            return turn_id, str(status.get("result", ""))
+            return session_id, str(status.get("result", ""))
         if state in {"FAILED", "FAILURE", "ERROR", "CANCELLED"}:
             raise AssertionError(f"execution {kid} failed: {status}")
         time.sleep(1.5)

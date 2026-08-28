@@ -1,15 +1,16 @@
 [project]
 name = "audio_quickstart"
 version = "0.1.0"
-description = "Reference conversational field assistant: audio -> transcription -> deployed flow (router + data agent + form agent, session state across kickoffs)"
+description = "Reference conversational field assistant: audio -> transcription -> conversational Flow (router + data agent + form agent, session state via handle_turn)"
 authors = [{ name = "CrewAI Field Engineering" }]
 requires-python = ">=3.10,<3.14"
 dependencies = [
-    "crewai==1.15.2",
+    "crewai==1.15.14",
 ]
 
 [project.scripts]
 kickoff = "audio_quickstart.main:kickoff"
+chat = "audio_quickstart.main:chat"
 plot = "audio_quickstart.main:plot"
 
 [dependency-groups]
@@ -39,8 +40,8 @@ build-backend = "hatchling.build"
 type = "flow"
 
 [tool.uv]
-# GHSA-xf7x-x43h-rpqh: json-repair < 0.60.1 has an unbounded-CPU DoS on
-# circular JSON Schema $refs. crewai 1.15.2 pins ~=0.25.2, so force the
+# json-repair < 0.60.1 has an unbounded-CPU DoS on
+# circular JSON Schema $refs. crewai 1.15.x pins an older line, so force the
 # patched line until crewai lifts its pin. API surface used by crewai
 # (repair_json / loads) is unchanged across this range.
 override-dependencies = ["json-repair>=0.60.1"]

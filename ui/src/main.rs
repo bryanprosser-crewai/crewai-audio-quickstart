@@ -3,8 +3,8 @@
 //! Pattern: paste three values (deployment URL, deployment bearer token,
 //! OpenAI key), all persisted to localStorage and sent nowhere except to
 //! those two APIs, directly from the browser. Mic → OpenAI transcription →
-//! deployment kickoff (fresh id per turn, chained via restoreFromStateId) →
-//! poll → reply, optionally spoken via the browser's speech synthesis.
+//! deployment kickoff (same session id every turn) → poll → reply, optionally
+//! spoken via the browser's speech synthesis.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -60,18 +60,13 @@ struct Msg {
 
 async fn kickoff(
     cfg: &Settings,
-    turn_id: &str,
-    restore_from: Option<&str>,
+    session_id: &str,
     message: &str,
 ) -> Result<String, String> {
     let url = format!("{}/kickoff", cfg.deployment_url.trim_end_matches('/'));
-    // Chain recipe: the platform deprecates reusing an id across kickoffs, so
-    // every turn gets a FRESH id and continuity comes from restoreFromStateId
-    // (top-level, beside "inputs") pointing at the previous turn's id.
-    let mut body = serde_json::json!({ "inputs": { "id": turn_id, "message": message } });
-    if let Some(prev) = restore_from {
-        body["restoreFromStateId"] = serde_json::json!(prev);
-    }
+    // Conversational contract: reuse the SAME session id every turn. AMP
+    // overlays inputs onto persisted ConversationState keyed on `id`.
+    let body = serde_json::json!({ "inputs": { "id": session_id, "message": message } });
     let resp = gloo_net::http::Request::post(&url)
         .header("Authorization", &format!("Bearer {}", cfg.deployment_token))
         .header("Content-Type", "application/json")
@@ -172,11 +167,7 @@ fn App() -> impl IntoView {
     let configured = initial.ready();
     let (settings, set_settings) = signal(initial);
     let (msgs, set_msgs) = signal(Vec::<Msg>::new());
-    // Last successful turn's state id — the conversation's chain head.
-    // None = fresh conversation; advanced only after a turn SUCCEEDS (a failed
-    // turn may have persisted nothing; restoring from it would silently drop
-    // the whole context).
-    let (chain_head, set_chain_head) = signal(Option::<String>::None);
+    let (session_id, set_session_id) = signal(Option::<String>::None);
     let (busy, set_busy) = signal(false);
     let (status, set_status) = signal(String::new());
     let (recording, set_recording) = signal(false);
@@ -199,10 +190,13 @@ fn App() -> impl IntoView {
         set_msgs.update(|m| m.push(Msg { role: "user", text: text.clone() }));
         set_busy.set(true);
         set_status.set("kicking off…".into());
-        let prev = chain_head.get_untracked();
-        let turn_id = uuid::Uuid::new_v4().to_string();
+        let sid = session_id.get_untracked().unwrap_or_else(|| {
+            let fresh = uuid::Uuid::new_v4().to_string();
+            set_session_id.set(Some(fresh.clone()));
+            fresh
+        });
         spawn_local(async move {
-            let outcome = match kickoff(&cfg, &turn_id, prev.as_deref(), &text).await {
+            let outcome = match kickoff(&cfg, &sid, &text).await {
                 Ok(kid) => {
                     set_status.set(format!("running ({kid})…"));
                     poll_result(&cfg, &kid).await
@@ -211,7 +205,6 @@ fn App() -> impl IntoView {
             };
             match outcome {
                 Ok(reply) => {
-                    set_chain_head.set(Some(turn_id.clone()));
                     if cfg.speak_replies {
                         speak(&reply);
                     }
@@ -427,10 +420,10 @@ fn App() -> impl IntoView {
                     </button>
                 </div>
                 <p class="sess">
-                    {concat!("build v", env!("CARGO_PKG_VERSION"), " · chain head: ")}
-                    {move || chain_head.get().unwrap_or_else(|| "(new conversation)".into())}
+                    {concat!("build v", env!("CARGO_PKG_VERSION"), " · session: ")}
+                    {move || session_id.get().unwrap_or_else(|| "(new conversation)".into())}
                     <button class="ghost" on:click=move |_| {
-                        set_chain_head.set(None);
+                        set_session_id.set(None);
                         set_msgs.set(Vec::new());
                         set_status.set("new conversation started".into());
                     }>"new conversation"</button>

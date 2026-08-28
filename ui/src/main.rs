@@ -3,7 +3,7 @@
 //! Pattern: paste three values (deployment URL, deployment bearer token,
 //! OpenAI key), all persisted to localStorage and sent nowhere except to
 //! those two APIs, directly from the browser. Mic → OpenAI transcription →
-//! AMP chat (/chat/start, /chat/{id}/message, /status, /history) → reply,
+//! AMP chat (/chat/start, /chat/{id}/message, SSE /stream/events) → reply,
 //! optionally spoken via the browser's speech synthesis.
 
 use std::cell::RefCell;
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
+use js_sys::{Reflect, Uint8Array};
 
 const SETTINGS_KEY: &str = "audio_quickstart_settings";
 const OPENAI_TRANSCRIPTIONS: &str = "https://api.openai.com/v1/audio/transcriptions";
@@ -55,7 +56,7 @@ struct Msg {
 }
 
 // ---------------------------------------------------------------------------
-// AMP chat API (start → message → poll → history)
+// AMP chat API (start → message → SSE → history fallback)
 // ---------------------------------------------------------------------------
 
 fn cors_hint(op: &str, e: impl std::fmt::Display) -> String {
@@ -127,34 +128,13 @@ async fn send_turn(cfg: &Settings, session_id: &str, message: &str) -> Result<St
     let path = format!("/chat/{session_id}/message");
     let v = authorized_json(
         cfg, "POST", &path,
-        Some(serde_json::json!({ "message": message, "stream": false })),
+        Some(serde_json::json!({ "message": message, "stream": true })),
     ).await?;
     json_id(&v, &["kickoff_id", "id"])
         .ok_or_else(|| format!("POST {path} returned no kickoff_id: {v}"))
 }
 
-async fn poll_turn(cfg: &Settings, kickoff_id: &str) -> Result<serde_json::Value, String> {
-    let path = format!("/status/{kickoff_id}");
-    for _ in 0..100 {
-        let v = authorized_json(cfg, "GET", &path, None).await?;
-        let state = v.get("state").or_else(|| v.get("status"))
-            .and_then(|s| s.as_str()).unwrap_or("").to_uppercase();
-        match state.as_str() {
-            "SUCCESS" | "SUCCEEDED" | "COMPLETED" | "COMPLETE" | "FINISHED" => return Ok(v),
-            "FAILED" | "FAILURE" | "ERROR" | "CANCELLED" => {
-                return Err(format!("turn ended in {state}: {v}"));
-            }
-            _ => gloo_timers::future::TimeoutFuture::new(2_500).await,
-        }
-    }
-    Err("timed out waiting for the turn".into())
-}
-
-async fn last_assistant_reply(
-    cfg: &Settings,
-    session_id: &str,
-    fallback: &serde_json::Value,
-) -> String {
+async fn last_assistant_reply(cfg: &Settings, session_id: &str) -> String {
     let path = format!("/chat/{session_id}/history");
     if let Ok(v) = authorized_json(cfg, "GET", &path, None).await {
         if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
@@ -170,9 +150,200 @@ async fn last_assistant_reply(
             }
         }
     }
-    fallback.get("result").and_then(|r| r.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| fallback.to_string())
+    String::new()
+}
+
+fn parse_sse_block(block: &str) -> Option<serde_json::Value> {
+    let mut data = String::new();
+    for line in block.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with(':') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    if data.is_empty() {
+        return None;
+    }
+    serde_json::from_str(&data).ok()
+}
+
+fn take_sse_frames(buf: &mut String) -> Vec<serde_json::Value> {
+    let normalized = buf.replace("\r\n", "\n").replace('\r', "\n");
+    *buf = normalized;
+    let mut out = Vec::new();
+    while let Some(idx) = buf.find("\n\n") {
+        let raw = buf[..idx].to_string();
+        *buf = buf[idx + 2..].to_string();
+        if let Some(v) = parse_sse_block(&raw) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+fn frame_token_delta(frame: &serde_json::Value) -> Option<String> {
+    let kind = frame.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let payload = frame.get("data").filter(|d| d.is_object());
+    match kind {
+        "token" => payload
+            .and_then(|d| d.get("content").or_else(|| d.get("text")))
+            .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        "message" | "conversation_message" => {
+            let role = payload
+                .and_then(|d| d.get("role"))
+                .or_else(|| frame.get("role"))
+                .and_then(|r| r.as_str())
+                .unwrap_or("");
+            if role != "assistant" {
+                return None;
+            }
+            payload
+                .and_then(|d| d.get("content").or_else(|| d.get("text")))
+                .and_then(|c| c.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        }
+        _ => None,
+    }
+}
+
+fn frame_terminal(frame: &serde_json::Value) -> Option<Result<String, String>> {
+    let kind = frame.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let payload = frame.get("data").cloned().unwrap_or_else(|| serde_json::json!({}));
+    match kind {
+        "turn_completed" => {
+            let extra = payload.get("content")
+                .or_else(|| payload.get("text"))
+                .or_else(|| payload.get("result"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            Some(Ok(extra.to_string()))
+        }
+        "turn_failed" | "error" => {
+            let msg = payload.get("message")
+                .or_else(|| payload.get("error"))
+                .and_then(|m| m.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| frame.to_string());
+            Some(Err(format!("turn failed: {msg}")))
+        }
+        _ => None,
+    }
+}
+
+async fn read_sse_chunk(
+    reader: &web_sys::ReadableStreamDefaultReader,
+) -> Result<Option<Vec<u8>>, String> {
+    let result = JsFuture::from(reader.read()).await.map_err(js_err)?;
+    let done = Reflect::get(&result, &JsValue::from_str("done"))
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if done {
+        return Ok(None);
+    }
+    let value = Reflect::get(&result, &JsValue::from_str("value")).map_err(js_err)?;
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    let arr = Uint8Array::new(&value);
+    let mut buf = vec![0u8; arr.length() as usize];
+    arr.copy_to(&mut buf);
+    Ok(Some(buf))
+}
+
+async fn attach_chat_sse(cfg: &Settings, session_id: &str) -> Result<web_sys::Response, String> {
+    let url = format!(
+        "{}/chat/{session_id}/stream/events?events=*&last_event_id=0-0",
+        cfg.deployment_url.trim_end_matches('/')
+    );
+    let window = web_sys::window().ok_or_else(|| "no window".to_string())?;
+    let headers = web_sys::Headers::new().map_err(js_err)?;
+    headers
+        .set("Authorization", &format!("Bearer {}", cfg.deployment_token))
+        .map_err(js_err)?;
+    headers.set("Accept", "text/event-stream").map_err(js_err)?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("GET");
+    init.set_headers(&headers);
+    let mut last_409 = String::new();
+    for _ in 0..20 {
+        let request = web_sys::Request::new_with_str_and_init(&url, &init).map_err(js_err)?;
+        let resp_val = JsFuture::from(window.fetch_with_request(&request))
+            .await
+            .map_err(|e| cors_hint("/chat/.../stream/events", format!("{e:?}")))?;
+        let resp: web_sys::Response = resp_val.dyn_into().map_err(js_err)?;
+        if resp.status() == 409 {
+            last_409 = JsFuture::from(resp.text().map_err(js_err)?)
+                .await
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            gloo_timers::future::TimeoutFuture::new(50).await;
+            continue;
+        }
+        if !resp.ok() {
+            let text = JsFuture::from(resp.text().map_err(js_err)?)
+                .await
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            return Err(format!(
+                "/chat/.../stream/events HTTP {}: {text}",
+                resp.status()
+            ));
+        }
+        return Ok(resp);
+    }
+    Err(format!(
+        "timed out attaching to chat SSE (last 409: {last_409})"
+    ))
+}
+
+/// Wait on AMP chat SSE. `on_token` receives each token/message delta so the
+/// UI can paint before `turn_completed`. Returns concatenated token text
+/// (empty for canned replies that never emit tokens).
+async fn wait_for_sse<F>(cfg: &Settings, session_id: &str, mut on_token: F) -> Result<String, String>
+where
+    F: FnMut(&str),
+{
+    let resp = attach_chat_sse(cfg, session_id).await?;
+    let body = resp.body().ok_or_else(|| "chat SSE had no body".to_string())?;
+    let reader: web_sys::ReadableStreamDefaultReader = body
+        .get_reader()
+        .dyn_into()
+        .map_err(|_| "chat SSE body is not a readable stream".to_string())?;
+    let mut rest = String::new();
+    let mut tokens = String::new();
+    loop {
+        let Some(bytes) = read_sse_chunk(&reader).await? else {
+            break;
+        };
+        rest.push_str(&String::from_utf8_lossy(&bytes));
+        for frame in take_sse_frames(&mut rest) {
+            if let Some(delta) = frame_token_delta(&frame) {
+                tokens.push_str(&delta);
+                on_token(&delta);
+            }
+            if let Some(terminal) = frame_terminal(&frame) {
+                let extra = terminal?;
+                if tokens.is_empty() && !extra.is_empty() {
+                    on_token(&extra);
+                    tokens.push_str(&extra);
+                }
+                return Ok(tokens);
+            }
+        }
+    }
+    Ok(tokens)
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +459,7 @@ fn App() -> impl IntoView {
 
     let recorder: Rc<RefCell<Option<web_sys::MediaRecorder>>> = Rc::new(RefCell::new(None));
 
-    // one user turn: start session if needed → /message → poll → history
+    // one user turn: start session if needed → /message → SSE (tokens paint live)
     let send_text = move |text: String, stt_ms: Option<f64>| {
         if text.trim().is_empty() || busy.get_untracked() {
             return;
@@ -323,11 +494,43 @@ fn App() -> impl IntoView {
                 }
             };
             set_status.set("sending turn…".into());
+            let mut painted = false;
             let outcome = match send_turn(&cfg, &sid, &text).await {
                 Ok(kid) => {
-                    set_status.set(format!("running ({kid})…"));
-                    match poll_turn(&cfg, &kid).await {
-                        Ok(status) => Ok(last_assistant_reply(&cfg, &sid, &status).await),
+                    set_status.set(format!("streaming ({kid})…"));
+                    match wait_for_sse(&cfg, &sid, |delta| {
+                        if !painted {
+                            set_msgs.update(|m| {
+                                m.push(Msg { role: "assistant", text: delta.to_string() })
+                            });
+                            painted = true;
+                        } else {
+                            set_msgs.update(|m| {
+                                if let Some(last) = m.last_mut() {
+                                    if last.role == "assistant" {
+                                        last.text.push_str(delta);
+                                    }
+                                }
+                            });
+                        }
+                    }).await {
+                        Ok(tokens) => {
+                            let reply = if tokens.is_empty() {
+                                last_assistant_reply(&cfg, &sid).await
+                            } else {
+                                tokens
+                            };
+                            if reply.is_empty() {
+                                Err("turn ended with no assistant text".into())
+                            } else {
+                                if !painted {
+                                    set_msgs.update(|m| {
+                                        m.push(Msg { role: "assistant", text: reply.clone() })
+                                    });
+                                }
+                                Ok(reply)
+                            }
+                        }
                         Err(e) => Err(e),
                     }
                 }
@@ -343,7 +546,6 @@ fn App() -> impl IntoView {
                         None
                     };
                     set_timing.set(format_timing(stt_ms, amp_ms, speak_ms));
-                    set_msgs.update(|m| m.push(Msg { role: "assistant", text: reply }));
                     set_status.set(String::new());
                 }
                 Err(e) => {

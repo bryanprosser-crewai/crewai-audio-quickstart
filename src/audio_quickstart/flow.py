@@ -27,6 +27,7 @@ wizard) on a ConversationState subclass and persist it across turns.
 Session contract:
     local:   flow.handle_turn(message, session_id=S)
     AMP:     POST /chat/start → S; then POST /chat/{S}/message {"message": ...}
+             Clients wait on GET /chat/{S}/stream/events (not /status poll).
              (AMP's chat worker calls handle_turn. conversation_start still
              hydrates a raw /kickoff if something hits that path.)
 """

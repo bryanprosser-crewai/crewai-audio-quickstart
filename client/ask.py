@@ -8,9 +8,11 @@ AMP chat API (see https://docs-platform.crewai.com/platform/en/guides/conversati
     2. SESSION      POST {deployment}/chat/start  -> session_id
                     (reused from .session on later turns; --new-session starts over)
     3. MESSAGE      POST {deployment}/chat/{session_id}/message
-                    {"message": "<transcript>"}  -> kickoff_id
-    4. POLL         GET  {deployment}/status/{kickoff_id} until it finishes
-    5. HISTORY      GET  {deployment}/chat/{session_id}/history  -> last assistant line
+                    {"message": "<transcript>", "stream": true}  -> kickoff_id
+    4. STREAM       GET  {deployment}/chat/{session_id}/stream/events
+                    until turn_completed (tokens as they arrive)
+    5. HISTORY      GET  {deployment}/chat/{session_id}/history
+                    only if the stream had no token text (canned replies)
 
 Usage:
 
@@ -46,8 +48,7 @@ import uuid
 OPENAI_TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
 SESSION_FILE = ".session"
 
-SUCCESS_STATES = {"SUCCESS", "SUCCEEDED", "COMPLETED", "COMPLETE", "FINISHED"}
-FAILURE_STATES = {"FAILED", "FAILURE", "ERROR", "CANCELLED"}
+SSE_ATTACH_PAUSE_S = 0.05
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -158,7 +159,7 @@ def start_session(base: str, token: str) -> str:
 def send_turn(base: str, token: str, session_id: str, message: str) -> str:
     data = http(
         "POST", f"{base}/chat/{session_id}/message", token,
-        body={"message": message, "stream": False},
+        body={"message": message, "stream": True},
     )
     kid = data.get("kickoff_id") or data.get("id")
     if not kid:
@@ -166,33 +167,134 @@ def send_turn(base: str, token: str, session_id: str, message: str) -> str:
     return str(kid)
 
 
-def wait_for_turn(base: str, token: str, kickoff_id: str,
-                  timeout_s: int = 300, poll_s: float = 3.0) -> dict:
-    deadline = time.monotonic() + timeout_s
-    last_state = ""
+def consume_sse_frames(readline, deadline: float) -> tuple[str, str]:
+    """Read AMP SSE frames until the turn ends.
+
+    Returns (outcome, text) where outcome is completed | failed | closed | timeout.
+    Token frames are concatenated; canned replies often have no tokens.
+    """
+    pending: list[str] = []
+    tokens: list[str] = []
+
+    def flush_block() -> tuple[str, str] | None:
+        if not pending:
+            return None
+        data = "\n".join(pending)
+        pending.clear()
+        try:
+            frame = json.loads(data)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(frame, dict):
+            return None
+        kind = str(frame.get("type") or "")
+        payload = frame.get("data") if isinstance(frame.get("data"), dict) else {}
+        if kind == "token":
+            piece = payload.get("content") or payload.get("text") or ""
+            if piece:
+                tokens.append(str(piece))
+            return None
+        if kind in {"message", "conversation_message"}:
+            role = payload.get("role") or frame.get("role") or ""
+            content = payload.get("content") or payload.get("text") or ""
+            if str(role) == "assistant" and content:
+                tokens.append(str(content))
+            return None
+        if kind == "turn_completed":
+            extra = payload.get("content") or payload.get("text") or payload.get("result") or ""
+            return ("completed", "".join(tokens) or str(extra))
+        if kind in {"turn_failed", "error"}:
+            msg = payload.get("message") or payload.get("error") or data
+            return ("failed", str(msg))
+        return None
+
     while time.monotonic() < deadline:
-        data = http("GET", f"{base}/status/{kickoff_id}", token)
-        state = str(data.get("state", data.get("status", ""))).upper()
-        if state != last_state:
-            print(f"   state: {state or '?'}", file=sys.stderr)
-            last_state = state
-        if state in SUCCESS_STATES:
-            return data
-        if state in FAILURE_STATES:
-            sys.exit(f"Turn failed:\n{json.dumps(data, indent=2)}")
-        time.sleep(poll_s)
-    sys.exit(f"Timed out after {timeout_s}s waiting for {kickoff_id}")
+        raw = readline()
+        if not raw:
+            terminal = flush_block()
+            if terminal:
+                return terminal
+            return ("closed", "".join(tokens))
+        line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+        if line.endswith("\n"):
+            line = line[:-1]
+        if line.endswith("\r"):
+            line = line[:-1]
+        if line == "":
+            terminal = flush_block()
+            if terminal:
+                return terminal
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            pending.append(line[5:].lstrip())
+    return ("timeout", "".join(tokens))
 
 
-def last_assistant_reply(base: str, token: str, session_id: str,
-                         fallback: dict) -> str:
+def open_chat_sse(base: str, token: str, session_id: str, deadline: float):
+    """Attach to the active turn's SSE. 409 = not published yet; retry briefly."""
+    url = (f"{base}/chat/{session_id}/stream/events"
+           "?events=*&last_event_id=0-0")
+    last_409 = ""
+    while time.monotonic() < deadline:
+        req = urllib.request.Request(
+            url, method="GET",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "text/event-stream",
+            },
+        )
+        remaining = max(1.0, deadline - time.monotonic())
+        try:
+            return urllib.request.urlopen(req, timeout=remaining)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            if exc.code == 409:
+                last_409 = detail
+                time.sleep(SSE_ATTACH_PAUSE_S)
+                continue
+            if exc.code in (401, 403):
+                sys.exit(
+                    f"{exc.code} from {url}\n{detail}\n\n"
+                    "Auth problem. Check CREWAI_DEPLOYMENT_TOKEN."
+                )
+            sys.exit(f"{exc.code} from {url}\n{detail}")
+    sys.exit(
+        f"Timed out attaching to {url}"
+        + (f"\nLast 409: {last_409}" if last_409 else "")
+    )
+
+
+def wait_for_turn_sse(base: str, token: str, session_id: str,
+                      timeout_s: int = 300) -> str:
+    """Wait on chat SSE; fall back to /history when the stream has no text."""
+    deadline = time.monotonic() + timeout_s
+    resp = open_chat_sse(base, token, session_id, deadline)
+    try:
+        outcome, text = consume_sse_frames(resp.readline, deadline)
+    finally:
+        resp.close()
+    if outcome == "failed":
+        sys.exit(f"Turn failed:\n{text}")
+    if outcome == "timeout":
+        sys.exit(f"Timed out after {timeout_s}s waiting on chat SSE ({session_id})")
+    if text.strip():
+        return text
+    reply = last_assistant_reply(base, token, session_id)
+    if reply:
+        return reply
+    sys.exit(f"Turn ended with no assistant text (session {session_id})")
+
+
+def last_assistant_reply(base: str, token: str, session_id: str) -> str:
     history = http("GET", f"{base}/chat/{session_id}/history", token)
     for msg in reversed(history.get("messages") or []):
         role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
         content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")
         if role == "assistant" and content:
             return str(content)
-    return str(fallback.get("result") or fallback.get("result_json") or fallback)
+    return ""
 
 
 def load_session_id() -> str | None:
@@ -266,13 +368,12 @@ def main() -> None:
         save_session_id(sid)
         print(f"   session_id: {sid}")
 
-    print(f"3) POST /chat/{sid}/message ...")
+    print(f"3) POST /chat/{sid}/message (stream) ...")
     kickoff_id = send_turn(base, token, sid, transcript)
     print(f"   kickoff_id: {kickoff_id}")
 
-    print("4) polling /status ...")
-    status = wait_for_turn(base, token, kickoff_id)
-    answer = last_assistant_reply(base, token, sid, status)
+    print("4) GET /chat/.../stream/events ...")
+    answer = wait_for_turn_sse(base, token, sid)
     print(f"\nanswer:\n{answer}")
 
 

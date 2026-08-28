@@ -11,10 +11,12 @@ Test tiers (markers registered in pyproject.toml):
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import pathlib
 import time
+import urllib.error
 import urllib.request
 import pytest
 
@@ -103,6 +105,17 @@ def browser_type_launch_args(browser_type_launch_args: dict, browser_name: str) 
 
 # -- tiny deployment client (stdlib only, mirrors client/ask.py) --------------
 
+def _ask():
+    spec = importlib.util.spec_from_file_location(
+        "audio_quickstart_client_ask", REPO_ROOT / "client" / "ask.py"
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {REPO_ROOT / 'client' / 'ask.py'}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _request(url: str, token: str, payload: dict | None = None) -> dict:
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
@@ -115,7 +128,8 @@ def _request(url: str, token: str, payload: dict | None = None) -> dict:
 
 def run_turn(dep: dict, message: str, session_id: str | None = None,
              timeout_s: int = 240) -> tuple[str, str]:
-    """One AMP chat turn → poll. Returns (session_id, result)."""
+    """One AMP chat turn → SSE. Returns (session_id, result)."""
+    ask = _ask()
     url, token = dep["url"], dep["token"]
     if not session_id:
         started = _request(f"{url}/chat/start", token, {})
@@ -123,21 +137,50 @@ def run_turn(dep: dict, message: str, session_id: str | None = None,
         if not session_id:
             raise AssertionError(f"POST /chat/start returned no session_id: {started}")
     sent = _request(f"{url}/chat/{session_id}/message", token,
-                    {"message": message, "stream": False})
+                    {"message": message, "stream": True})
     kid = sent.get("kickoff_id") or sent.get("id")
     if not kid:
         raise AssertionError(f"POST /chat/.../message returned no kickoff_id: {sent}")
     deadline = time.monotonic() + timeout_s
+    sse_url = (f"{url}/chat/{session_id}/stream/events"
+               "?events=*&last_event_id=0-0")
+    last_409 = ""
+    resp = None
     while time.monotonic() < deadline:
-        status = _request(f"{url}/status/{kid}", token)
-        state = str(status.get("state") or status.get("status") or "").upper()
-        if state in {"SUCCESS", "SUCCEEDED", "COMPLETED", "COMPLETE", "FINISHED"}:
-            history = _request(f"{url}/chat/{session_id}/history", token)
-            for msg in reversed(history.get("messages") or []):
-                if isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("content"):
-                    return session_id, str(msg["content"])
-            return session_id, str(status.get("result", ""))
-        if state in {"FAILED", "FAILURE", "ERROR", "CANCELLED"}:
-            raise AssertionError(f"execution {kid} failed: {status}")
-        time.sleep(1.5)
-    raise AssertionError(f"timed out waiting for execution {kid}")
+        req = urllib.request.Request(
+            sse_url, method="GET",
+            headers={"Authorization": f"Bearer {token}",
+                     "Accept": "text/event-stream"},
+        )
+        try:
+            resp = urllib.request.urlopen(
+                req, timeout=max(1.0, deadline - time.monotonic())
+            )
+            break
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            if exc.code == 409:
+                last_409 = detail
+                time.sleep(0.05)
+                continue
+            raise AssertionError(f"{exc.code} from {sse_url}\n{detail}") from exc
+    if resp is None:
+        raise AssertionError(
+            f"timed out attaching to chat SSE for {kid}"
+            + (f"\nLast 409: {last_409}" if last_409 else "")
+        )
+    try:
+        outcome, text = ask.consume_sse_frames(resp.readline, deadline)
+    finally:
+        resp.close()
+    if outcome == "failed":
+        raise AssertionError(f"execution {kid} failed: {text}")
+    if outcome == "timeout":
+        raise AssertionError(f"timed out waiting for execution {kid}")
+    if text.strip():
+        return session_id, text
+    history = _request(f"{url}/chat/{session_id}/history", token)
+    for msg in reversed(history.get("messages") or []):
+        if isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("content"):
+            return session_id, str(msg["content"])
+    raise AssertionError(f"turn {kid} ended with no assistant text")

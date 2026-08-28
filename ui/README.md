@@ -24,7 +24,8 @@ Then type — or click **🎤 Talk**, speak, click **Stop**. The reply can be
 spoken aloud (checkbox in Settings) via the browser's speech synthesis.
 
 Conversation continuity is an AMP **chat session**: the first turn calls
-`POST /chat/start`, later turns `POST /chat/{id}/message` (the footer shows
+`POST /chat/start`, later turns `POST /chat/{id}/message` with streaming on,
+then `GET /chat/{id}/stream/events` until `turn_completed` (the footer shows
 the session id). **"New conversation"** drops it and starts over; keeping it
 is what makes the form wizard work.
 

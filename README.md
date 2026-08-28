@@ -19,7 +19,11 @@ audio file / mic ──► OpenAI transcription — the CLIENT's key, used only 
                           ▼
              POST {deployment}/chat/start              → session_id  (once)
              POST {deployment}/chat/{session_id}/message
-               {"message": "<transcript>"}             → one turn
+               {"message": "<transcript>", "stream": true}
+                          │
+                          ▼
+             GET  {deployment}/chat/{session_id}/stream/events
+               SSE until turn_completed (token frames as they arrive)
                           │
                           ▼
         AssistantFlow  (conversational=True; one handle_turn / kickoff = one utterance)
@@ -40,8 +44,11 @@ audio file / mic ──► OpenAI transcription — the CLIENT's key, used only 
 
 **Session contract:** locally, `flow.handle_turn(message, session_id=S)`. On AMP,
 `POST /chat/start` creates `S`, then each utterance is
-`POST /chat/{S}/message` with `{"message": "<text>"}`. A new conversation is a
-new `/chat/start`. The reply is a string (also on `GET /chat/{S}/history`).
+`POST /chat/{S}/message` with `{"message": "<text>", "stream": true}`. The
+client attaches to `GET /chat/{S}/stream/events` and waits for
+`turn_completed` (token frames paint as they arrive). A new conversation is a
+new `/chat/start`. Canned replies that emit no tokens fall back to
+`GET /chat/{S}/history`.
 
 This is CrewAI AMP's conversational chat API (same shape as the ClickHouse
 dashboards gateway). The previous `/kickoff` + `restoreFromStateId` chain is gone.
@@ -67,9 +74,10 @@ python3 client/ask.py samples/question.wav
 ```
 
 `client/ask.py` is stdlib-only and does the AMP chat loop: transcribe →
-`/chat/start` (or reuse `.session`) → `/chat/{id}/message` → poll `/status` →
-print the last assistant line from `/history`. Consecutive clips continue ONE
-conversation — which is what makes the form wizard work by voice:
+`/chat/start` (or reuse `.session`) → `/chat/{id}/message` → SSE
+`/chat/{id}/stream/events` → print token text (or `/history` if none).
+Consecutive clips continue ONE conversation — which is what makes the form
+wizard work by voice:
 
 ```bash
 python3 client/ask.py clips/file-a-report.wav      # "I'd like to file a maintenance report"
@@ -92,7 +100,7 @@ produces wav/mp3/m4a.
 
 A fully client-side web UI (Rust/Leptos → WASM): paste your deployment URL,
 bearer token, and OpenAI key, then talk — mic capture → transcription → AMP chat
-turn → spoken reply via the browser's speech synthesis. The three values are stored only
+SSE turn → spoken reply via the browser's speech synthesis. The three values are stored only
 in your browser's localStorage; the browser sends the deployment values only to
 your deployment endpoint and the OpenAI key only to OpenAI's transcription API.
 (The deployed flow's agents use the key configured on the deployment — the
@@ -126,7 +134,7 @@ src/audio_quickstart/
 ├── forms.py     # form schemas, typed validation, session state machine
 ├── data.py      # synthetic SQLite readings (the stubbed "warehouse")
 └── main.py      # local smoke (handle_turn) + chat() REPL
-client/ask.py    # stdlib audio client (transcribe → AMP chat turn → poll)
+client/ask.py    # stdlib audio client (transcribe → AMP chat turn → SSE)
 ui/              # Leptos (Rust/WASM) browser client
 ```
 

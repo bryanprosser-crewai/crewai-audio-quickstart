@@ -4,7 +4,7 @@
 //! OpenAI key), all persisted to localStorage and sent nowhere except to
 //! those two APIs, directly from the browser. Mic → OpenAI transcription →
 //! AMP chat (/chat/start, /chat/{id}/message, SSE /stream/events) → reply,
-//! optionally spoken via the browser's speech synthesis.
+//! spoken per sentence via the browser's speech synthesis as tokens arrive.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -410,33 +410,158 @@ fn format_timing(stt_ms: Option<f64>, amp_ms: f64, speak_ms: Option<Result<f64, 
     parts.join(" · ")
 }
 
-/// Speak the reply and return ms until playback actually starts (`onstart`).
-async fn speak_until_start(text: &str) -> Result<f64, String> {
+/// Speak clauses as they complete. `to audio` is first `onstart` minus `t0`
+/// (AMP send), not the full reply.
+fn cancel_speech() {
+    if let Some(window) = web_sys::window() {
+        if let Ok(synth) = window.speech_synthesis() {
+            synth.cancel();
+        }
+    }
+}
+
+fn next_sentence_break(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    for (i, c) in s.char_indices() {
+        if c == '\n' {
+            let mut take = i + 1;
+            while take < s.len() && s.as_bytes()[take].is_ascii_whitespace() {
+                take += 1;
+            }
+            return Some(take);
+        }
+        if matches!(c, '.' | '!' | '?') {
+            let next = i + c.len_utf8();
+            let prev_digit = i > 0 && bytes[i - 1].is_ascii_digit();
+            let next_digit = next < bytes.len() && bytes[next].is_ascii_digit();
+            if c == '.' && prev_digit && next_digit {
+                continue;
+            }
+            if next >= s.len() || bytes[next].is_ascii_whitespace() {
+                let mut take = next;
+                while take < s.len() && s.as_bytes()[take].is_ascii_whitespace() {
+                    take += 1;
+                }
+                return Some(take);
+            }
+        }
+    }
+    None
+}
+
+fn take_sentences(buf: &mut String) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some(end) = next_sentence_break(buf) {
+        let piece = buf[..end].trim().to_string();
+        buf.drain(..end);
+        if !piece.is_empty() {
+            out.push(piece);
+        }
+    }
+    out
+}
+
+struct FirstAudio {
+    resolve: Rc<RefCell<Option<js_sys::Function>>>,
+    reject: Rc<RefCell<Option<js_sys::Function>>>,
+    promise: js_sys::Promise,
+}
+
+impl FirstAudio {
+    fn new() -> Self {
+        let resolve = Rc::new(RefCell::new(None));
+        let reject = Rc::new(RefCell::new(None));
+        let resolve_c = resolve.clone();
+        let reject_c = reject.clone();
+        let promise = js_sys::Promise::new(&mut |res, rej| {
+            *resolve_c.borrow_mut() = Some(res);
+            *reject_c.borrow_mut() = Some(rej);
+        });
+        Self {
+            resolve,
+            reject,
+            promise,
+        }
+    }
+}
+
+fn enqueue_speak(text: &str, t0: f64, first: &FirstAudio, capture: bool) -> Result<(), String> {
     let window = web_sys::window().ok_or_else(|| "no window".to_string())?;
     let synth = window.speech_synthesis().map_err(js_err)?;
-    let utt = Rc::new(
-        web_sys::SpeechSynthesisUtterance::new_with_text(text).map_err(js_err)?,
-    );
-    let t0 = now_ms();
-    let promise = js_sys::Promise::new(&mut |resolve, reject| {
-        let utt = utt.clone();
-        let resolve = resolve.clone();
+    let utt = web_sys::SpeechSynthesisUtterance::new_with_text(text).map_err(js_err)?;
+    if capture {
+        let resolve = first.resolve.borrow_mut().take();
+        let reject = first.reject.borrow_mut().take();
         let on_start = Closure::<dyn FnMut()>::once(move || {
-            let _ = resolve.call1(&JsValue::UNDEFINED, &JsValue::from_f64(now_ms() - t0));
+            if let Some(r) = resolve {
+                let _ = r.call1(&JsValue::UNDEFINED, &JsValue::from_f64(now_ms() - t0));
+            }
         });
         utt.set_onstart(Some(on_start.as_ref().unchecked_ref()));
         on_start.forget();
-
         let on_error = Closure::<dyn FnMut()>::once(move || {
-            let _ = reject.call1(&JsValue::UNDEFINED, &JsValue::from_str("speech synthesis error"));
+            if let Some(r) = reject {
+                let _ = r.call1(
+                    &JsValue::UNDEFINED,
+                    &JsValue::from_str("speech synthesis error"),
+                );
+            }
         });
         utt.set_onerror(Some(on_error.as_ref().unchecked_ref()));
         on_error.forget();
+    }
+    synth.speak(&utt);
+    Ok(())
+}
 
-        synth.speak(&utt);
-    });
-    let value = JsFuture::from(promise).await.map_err(js_err)?;
-    value.as_f64().ok_or_else(|| "speech start returned no time".into())
+struct SentenceTts {
+    buf: String,
+    uttered: bool,
+    t0: f64,
+    first: FirstAudio,
+}
+
+impl SentenceTts {
+    fn new(t0: f64) -> Self {
+        Self {
+            buf: String::new(),
+            uttered: false,
+            t0,
+            first: FirstAudio::new(),
+        }
+    }
+
+    fn push(&mut self, delta: &str) {
+        self.buf.push_str(delta);
+        for s in take_sentences(&mut self.buf) {
+            self.speak(&s);
+        }
+    }
+
+    fn flush(&mut self) {
+        let rest = std::mem::take(&mut self.buf);
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            self.speak(rest);
+        }
+    }
+
+    fn speak_all(&mut self, text: &str) {
+        self.buf.push_str(text);
+        self.flush();
+    }
+
+    fn speak(&mut self, text: &str) {
+        let capture = !self.uttered;
+        self.uttered = true;
+        if let Err(e) = enqueue_speak(text, self.t0, &self.first, capture) {
+            if capture {
+                if let Some(r) = self.first.reject.borrow_mut().take() {
+                    let _ = r.call1(&JsValue::UNDEFINED, &JsValue::from_str(&e));
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +601,14 @@ fn App() -> impl IntoView {
         let existing = session_id.get_untracked();
         spawn_local(async move {
             let amp_t0 = now_ms();
+            if cfg.speak_replies {
+                cancel_speech();
+            }
+            let tts = if cfg.speak_replies {
+                Some(Rc::new(RefCell::new(SentenceTts::new(amp_t0))))
+            } else {
+                None
+            };
             let sid = match existing {
                 Some(s) => s,
                 None => {
@@ -513,6 +646,9 @@ fn App() -> impl IntoView {
                                 }
                             });
                         }
+                        if let Some(t) = &tts {
+                            t.borrow_mut().push(delta);
+                        }
                     }).await {
                         Ok(tokens) => {
                             let reply = if tokens.is_empty() {
@@ -539,9 +675,31 @@ fn App() -> impl IntoView {
             let amp_ms = now_ms() - amp_t0;
             match outcome {
                 Ok(reply) => {
-                    let speak_ms = if cfg.speak_replies {
+                    let speak_ms = if let Some(t) = &tts {
                         set_status.set("speaking…".into());
-                        Some(speak_until_start(&reply).await)
+                        {
+                            let mut speaker = t.borrow_mut();
+                            speaker.flush();
+                            if !speaker.uttered {
+                                speaker.speak_all(&reply);
+                            }
+                        }
+                        let uttered = t.borrow().uttered;
+                        if uttered {
+                            let promise = t.borrow().first.promise.clone();
+                            Some(
+                                JsFuture::from(promise)
+                                    .await
+                                    .map_err(js_err)
+                                    .and_then(|v| {
+                                        v.as_f64().ok_or_else(|| {
+                                            "speech start returned no time".into()
+                                        })
+                                    }),
+                            )
+                        } else {
+                            Some(Err("nothing to speak".into()))
+                        }
                     } else {
                         None
                     };

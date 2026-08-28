@@ -11,13 +11,16 @@ wizard) on a ConversationState subclass and persist it across turns.
     deterministic-first router          zero LLM calls where possible:
         ├─ quit/goodbye regex  ──────►  canned goodbye  (no LLM)
         ├─ form active + cancel ─────►  canned cancel   (no LLM)
-        ├─ form active ──────────────►  form agent (continues the wizard)
+        ├─ form active ──────────────►  FORM (extract + canned next prompt)
         └─ otherwise: one small LLM
            classification call ──────►  ASSET_DATA | START_FORM:<type> | UNKNOWN
         │
         ▼
-    agent handlers (each agent has its OWN LLM instance — usage counters
-    are scoped per LLM object, sharing one pools the numbers)
+    handlers
+        ├─ ASSET_DATA  — data agent.kickoff (tools; native LLM loop)
+        ├─ START_FORM  — canned first question (zero LLM)
+        ├─ FORM        — 1× LLM.call JSON extract + validate_field + canned prompt
+        └─ CANCEL / GOODBYE / UNKNOWN — canned
         │
         ▼
     @persist state keyed on `id` (= session_id) — messages + form progress
@@ -34,6 +37,7 @@ Session contract:
 
 from __future__ import annotations
 
+import json
 import re
 
 from pydantic import Field
@@ -43,12 +47,25 @@ from crewai.experimental.conversational import ConversationConfig, ConversationS
 from crewai.flow import listen
 from crewai.flow.persistence import persist
 
-from audio_quickstart.agents import build_data_agent, build_form_agent
+from audio_quickstart.agents import build_data_agent
 from audio_quickstart.data import connect
-from audio_quickstart.forms import FORM_SCHEMAS
+from audio_quickstart.forms import (
+    FORM_SCHEMAS,
+    FormSession,
+    ask_field,
+    extract_system_prompt,
+    parse_extract_json,
+    readback_and_confirm,
+    start_form_prompt,
+    validate_field,
+)
 
 _QUIT_RE = re.compile(r"\b(quit|exit|goodbye|bye)\b", re.IGNORECASE)
 _CANCEL_RE = re.compile(r"\b(cancel|abort)\b", re.IGNORECASE)
+_CONFIRM_RE = re.compile(
+    r"\b(confirm|submit|that's right|looks good|yes|yeah|yep)\b",
+    re.IGNORECASE,
+)
 _FORM_CLOSED_RE = re.compile(
     r"form cancelled|mock submit ok|report (has been )?filed",
     re.IGNORECASE,
@@ -113,7 +130,6 @@ class AssistantFlow(Flow[AssistantState]):
         self.defer_trace_finalization = False
         self._conn = None
         self._data_agent = None
-        self._form_agent = None
         self._form_session = None
         self._classifier_llm = LLM(model="openai/gpt-4o", temperature=0, timeout=30)
 
@@ -145,17 +161,21 @@ class AssistantFlow(Flow[AssistantState]):
             self._data_agent = build_data_agent(self._conn)
         return self._data_agent
 
-    def _form(self):
-        if self._form_agent is None:
-            self._form_agent, self._form_session = build_form_agent(self.state.form_type)
-            self._form_session.data.update(self.state.form_data)  # re-seed after restore
-        return self._form_agent
+    def _ensure_form_session(self) -> FormSession | None:
+        """Rebuild the wizard from persisted form_type + form_data (AMP restores state, not objects)."""
+        form_type = self.state.form_type
+        if form_type not in FORM_SCHEMAS:
+            return None
+        if self._form_session is None or self._form_session.schema.form_type != form_type:
+            self._form_session = FormSession(FORM_SCHEMAS[form_type])
+        self._form_session.data = dict(self.state.form_data or {})
+        return self._form_session
 
     def _clear_form(self) -> None:
         self.state.active_mode = None
         self.state.form_type = None
         self.state.form_data = {}
-        self._form_agent = self._form_session = None
+        self._form_session = None
 
     def _utterance(self) -> str:
         return (self.state.current_user_message or self.state.message or "").strip()
@@ -291,13 +311,65 @@ class AssistantFlow(Flow[AssistantState]):
                 lines.append({"role": role, "content": content})
         return lines
 
-    def _run_form(self) -> str:
-        agent = self._form()
-        reply = str(agent.kickoff(self._context()))
-        self.state.form_data = dict(self._form_session.data)
-        if self._form_session.submitted:
-            self._clear_form()
-        return reply
+    def _extract_field_value(self, field, utterance: str) -> dict:
+        raw = str(self._classifier_llm.call(messages=[
+            {"role": "system", "content": extract_system_prompt(field)},
+            {"role": "user", "content": utterance},
+        ]))
+        return parse_extract_json(raw)
+
+    def _submit_form(self, session: FormSession) -> str:
+        missing = session.missing_required()
+        if missing:
+            field = missing[0]
+            return f"Can't submit yet — still need {field.label}. {ask_field(field)}"
+        payload = json.dumps(session.data)
+        self._clear_form()
+        return f"MOCK SUBMIT OK (no records system connected): {payload}"
+
+    def _run_form(self, *, starting: bool = False) -> str:
+        """One field per turn: canned start, then 1× LLM.call extract + Python validate."""
+        session = self._ensure_form_session()
+        if session is None:
+            return "I don't have a form in progress. Ask to file a maintenance or incident report."
+        if starting:
+            return start_form_prompt(session)
+
+        message = self._utterance()
+        if not session.missing_required() and _CONFIRM_RE.search(message):
+            return self._submit_form(session)
+
+        field = session.next_open_field()
+        if field is None:
+            return readback_and_confirm(session)
+
+        try:
+            extracted = self._extract_field_value(field, message)
+        except Exception:
+            return f"I didn't catch that. {ask_field(field)}"
+
+        if extracted.get("skip") and not field.required:
+            session.data[field.name] = ""
+            self.state.form_data = dict(session.data)
+            nxt = session.next_open_field()
+            if nxt is None:
+                return f"Skipping {field.label}. {readback_and_confirm(session)}"
+            return f"Skipping {field.label}. {ask_field(nxt)}"
+
+        if extracted.get("error") or "value" not in extracted:
+            return f"I didn't catch a {field.label}. {ask_field(field)}"
+
+        normalised, error = validate_field(field, str(extracted["value"]).strip())
+        if error:
+            return f"{error} {ask_field(field)}"
+
+        session.data[field.name] = normalised
+        self.state.form_data = dict(session.data)
+        nxt = session.next_open_field()
+        ack = f"Got it — {field.label} is {normalised}."
+        if nxt is None:
+            return f"{ack} {readback_and_confirm(session)}"
+        return f"{ack} {ask_field(nxt)}"
 
     # -- handlers (method name ≠ route label, or the graph re-triggers) ------
 
@@ -310,16 +382,16 @@ class AssistantFlow(Flow[AssistantState]):
 
     @listen("START_FORM")
     def handle_start_form(self) -> str:
-        """User wants to file a maintenance or incident report — start the wizard."""
-        self._form_agent = self._form_session = None
+        """User wants to file a maintenance or incident report — canned first question."""
+        self._form_session = None
         self.state.active_mode = "form"
         self.state.form_data = {}
-        reply = self._run_form()
+        reply = self._run_form(starting=True)
         return self._reply_form(reply)
 
     @listen("FORM")
     def handle_form(self) -> str:
-        """Continue the in-progress voice-guided form (one field per turn)."""
+        """Continue the wizard: extract one value, validate, canned next prompt."""
         reply = self._run_form()
         return self._reply_form(reply)
 

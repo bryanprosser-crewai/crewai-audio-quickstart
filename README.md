@@ -34,9 +34,9 @@ audio file / mic ──► OpenAI transcription — the CLIENT's key, used only 
         │    get_latest_reading · get_period_stats · list_assets
         │    (fuzzy name matching → canonical names; "latest" skips the
         │    in-progress day and says so when it can't)
-        ├─ Form agent — voice-guided wizard (maintenance / incident report):
-        │    one field per turn, typed validation, read-back, explicit
-        │    "confirm" before a (mock) submission
+        ├─ Form wizard — canned first question; then 1× LLM.call JSON extract
+        │    + Python validate_field + canned next prompt (maintenance /
+        │    incident). Read-back, explicit "confirm" before a mock submit.
         └─ ConversationState + @persist keyed on `id`: messages + form progress
            survive across turns (on AMP SaaS, state lands on the persistent
            volume by default)
@@ -49,6 +49,9 @@ client attaches to `GET /chat/{S}/stream/events` and waits for
 `turn_completed` (token frames paint as they arrive). A new conversation is a
 new `/chat/start`. Canned replies that emit no tokens fall back to
 `GET /chat/{S}/history`.
+
+Streaming voice (sentence TTS, live STT, TTFA) is on branch `streaming-voice`;
+see [`STREAMING.md`](STREAMING.md).
 
 This is CrewAI AMP's conversational chat API (same shape as the ClickHouse
 dashboards gateway). The previous `/kickoff` + `restoreFromStateId` chain is gone.
@@ -129,9 +132,9 @@ don't change.
 ```
 src/audio_quickstart/
 ├── flow.py      # AssistantFlow: conversational router + handlers + @persist
-├── agents.py    # data agent + form agent (one LLM instance per agent)
+├── agents.py    # data agent; form Agent.kickoff helper (unused on live path)
 ├── tools.py     # 3 data tools (SQLite) + 3 form tools; caching disabled
-├── forms.py     # form schemas, typed validation, session state machine
+├── forms.py     # schemas, canned prompts, JSON extract helpers, validation
 ├── data.py      # synthetic SQLite readings (the stubbed "warehouse")
 └── main.py      # local smoke (handle_turn) + chat() REPL
 client/ask.py    # stdlib audio client (transcribe → AMP chat turn → SSE)

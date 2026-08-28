@@ -20,8 +20,9 @@ Fill in Settings:
 | Deployment bearer token | same page |
 | OpenAI API key | only needed for the 🎤 mic button — it is used for transcription and nothing else (the deployed flow's agents run on the key configured on the deployment, not this one) |
 
-Then type — or click **🎤 Talk**, speak, click **Stop**. The reply can be
-spoken aloud (checkbox in Settings) via the browser's speech synthesis.
+Then type — or click **🎤 Talk**, speak, click **Stop**. With **Speak replies**
+on, the UI speaks each sentence as AMP SSE tokens arrive (browser
+`speechSynthesis`); **to audio** is first playback start, not the full reply.
 
 Conversation continuity is an AMP **chat session**: the first turn calls
 `POST /chat/start`, later turns `POST /chat/{id}/message` with streaming on,

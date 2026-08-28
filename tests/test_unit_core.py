@@ -13,7 +13,14 @@ import pytest
 
 from audio_quickstart.data import ASSETS, connect
 from audio_quickstart.flow import AssistantFlow
-from audio_quickstart.forms import FORM_SCHEMAS, FormSession, validate_field
+from audio_quickstart.forms import (
+    FORM_SCHEMAS,
+    FormSession,
+    ask_field,
+    parse_extract_json,
+    start_form_prompt,
+    validate_field,
+)
 from audio_quickstart.tools import (
     ListAssetsTool,
     SetFieldTool,
@@ -132,6 +139,27 @@ def test_form_session_tracks_missing():
     assert "AssetId" not in {f.name for f in session.missing_required()}
 
 
+def test_next_open_field_and_canned_prompts():
+    session = FormSession(FORM_SCHEMAS["maintenance_report"])
+    first = session.next_open_field()
+    assert first is not None and first.name == "AssetId"
+    prompt = start_form_prompt(session)
+    assert "Starting the Maintenance Report" in prompt
+    assert "Asset ID" in prompt
+    assert ask_field(first).startswith("What's the Asset ID?")
+    session.data["AssetId"] = "PUMP A1"
+    assert session.next_open_field().name == "WorkDone"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ('{"value": "PUMP A1"}', {"value": "PUMP A1"}),
+    ("```json\n{\"skip\": true}\n```", {"skip": True}),
+    ("not json", {"error": "unclear"}),
+])
+def test_parse_extract_json(raw, expected):
+    assert parse_extract_json(raw) == expected
+
+
 # -- deterministic router ladder (zero LLM calls by construction) -------------
 
 @pytest.fixture()
@@ -218,3 +246,45 @@ def test_conversation_start_hydrates_amp_kickoff_message(flow):
     flow.conversation_start()
     assert flow.state.current_user_message == "cancel that"
     assert flow.route_turn({}) == "CANCEL"
+
+
+def test_start_form_is_canned_zero_llm(flow):
+    flow.state.form_type = "maintenance_report"
+    flow.state.current_user_message = "I want to file a maintenance report"
+    reply = flow.handle_start_form()
+    assert "Starting the Maintenance Report" in reply
+    assert "Asset ID" in reply
+    assert flow.state.active_mode == "form"
+    assert flow.state.form_data == {}
+
+
+def test_form_turn_stores_extracted_value(flow):
+    class _FakeLlm:
+        def call(self, messages=None, **kwargs):
+            return '{"value": "PUMP A1"}'
+
+    flow._classifier_llm = _FakeLlm()
+    flow.state.form_type = "maintenance_report"
+    flow.state.active_mode = "form"
+    flow.state.form_data = {}
+    flow.state.current_user_message = "the asset is pump a1"
+    reply = flow.handle_form()
+    assert flow.state.form_data["AssetId"] == "PUMP A1"
+    assert "Work Done" in reply
+
+
+def test_form_confirm_submits_without_llm(flow):
+    flow.state.form_type = "maintenance_report"
+    flow.state.active_mode = "form"
+    flow.state.form_data = {
+        "AssetId": "PUMP A1",
+        "WorkDone": "oil change",
+        "TimeSpentHours": "1.5",
+        "CompletionDate": "2026-07-13",
+        "ReportedBy": "T-100",
+    }
+    flow.state.current_user_message = "confirm"
+    reply = flow.handle_form()
+    assert "MOCK SUBMIT OK" in reply
+    assert flow.state.active_mode is None
+    assert flow.state.form_data == {}

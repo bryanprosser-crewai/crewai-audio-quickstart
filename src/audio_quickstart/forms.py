@@ -1,14 +1,15 @@
 """Form schemas + session state machine — the voice-guided form-filling pattern.
 
-The wizard is LLM-driven but state-validated: the agent asks one field at a
-time, every value passes typed validation before it is stored, the completed
-form is read back, and submission happens only on an explicit "confirm".
-Submission is mocked (see tools.SubmitFormTool) — a real deployment POSTs to
-whatever records system the customer uses.
+The live Flow path is one LLM.call per field (JSON extract) plus canned
+prompts and typed validation. tools.SetFieldTool / SubmitFormTool remain for
+the unused Agent.kickoff form agent. Submission is mocked — a real
+deployment POSTs to whatever records system the customer uses.
 """
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass, field as dc_field
 from datetime import datetime
 from typing import Any
@@ -86,6 +87,65 @@ class FormSession:
 
     def missing_required(self) -> list[FormField]:
         return [f for f in self.schema.fields if f.required and f.name not in self.data]
+
+
+    def next_open_field(self) -> FormField | None:
+        """First schema field that does not yet have a stored value."""
+        for f in self.schema.fields:
+            if f.name not in self.data:
+                return f
+        return None
+
+
+def ask_field(field: FormField) -> str:
+    """Canned voice prompt for one field — no LLM."""
+    extra = f" {field.hint}" if field.hint else ""
+    if field.field_type == "choice" and field.options:
+        extra = f" Choose one: {', '.join(field.options)}."
+    return f"What's the {field.label}?{extra}"
+
+
+def readback_and_confirm(session: FormSession) -> str:
+    bits = [f"{f.label}: {session.data.get(f.name, '(blank)')}" for f in session.schema.fields]
+    return ("I've got " + "; ".join(bits) + ". Say confirm to submit, or cancel to abort.")
+
+
+def start_form_prompt(session: FormSession) -> str:
+    first = session.schema.fields[0]
+    return f"Starting the {session.schema.title}. {ask_field(first)}"
+
+
+_EXTRACT_SYSTEM = """\
+You extract one form-field value from a spoken or typed utterance.
+Reply with JSON only, no markdown.
+If you can read a value, return {"value": "<normalized string>"}.
+Normalize numbers to digits (e.g. "five hours" → "5").
+Normalize dates to YYYY-MM-DD when you can.
+If the field is optional and the user declines (none, skip, no), return {"skip": true}.
+If you cannot extract a usable value, return {"error": "unclear"}."""
+
+
+def extract_system_prompt(field: FormField) -> str:
+    opts = f" Options: {list(field.options)}." if field.options else ""
+    return (
+        f"{_EXTRACT_SYSTEM}\n"
+        f"Field name: {field.name}\n"
+        f"Label: {field.label}\n"
+        f"Type: {field.field_type}.{opts}"
+    )
+
+
+def parse_extract_json(raw: str) -> dict:
+    """Parse the slot-filler JSON; tolerate optional markdown fences."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {"error": "unclear"}
+    return data if isinstance(data, dict) else {"error": "unclear"}
 
 
 def validate_field(field: FormField, value: str) -> tuple[str, str | None]:

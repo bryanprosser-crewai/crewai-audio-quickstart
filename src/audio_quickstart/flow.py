@@ -1,11 +1,8 @@
-"""AssistantFlow — a conversational field-assistant, one handle_turn per utterance.
+"""AssistantFlow — a conversational field-assistant flow, one kickoff per turn.
 
-Same shape as CrewAI conversational Flows (see the ClickHouse dashboards
-example): each user line is a new graph run with the SAME session id.
-The framework owns message history; we keep extra domain state (the form
-wizard) on a ConversationState subclass and persist it across turns.
+Architecture (the shape we see working in production engagements):
 
-    handle_turn(message, session_id=S)
+    kickoff inputs {id, message}
         │
         ▼
     deterministic-first router          zero LLM calls where possible:
@@ -20,27 +17,29 @@ wizard) on a ConversationState subclass and persist it across turns.
     are scoped per LLM object, sharing one pools the numbers)
         │
         ▼
-    @persist state keyed on `id` (= session_id) — messages + form progress
-    survive across turn executions (on CrewAI AMP SaaS, state lands on the
-    persistent volume by default).
+    @persist state keyed on `id` — history + form progress survive across
+    kickoff executions (on CrewAI AMP SaaS, state lands on the persistent
+    volume by default).
 
-Session contract:
-    local:   flow.handle_turn(message, session_id=S)
-    AMP:     POST /chat/start → S; then POST /chat/{S}/message {"message": ...}
-             Clients wait on GET /chat/{S}/stream/events (not /status poll).
-             (AMP's chat worker calls handle_turn. conversation_start still
-             hydrates a raw /kickoff if something hits that path.)
+Session contract (one kickoff = one conversational turn):
+    inputs: {"id": "<FRESH uuid>", "message": "<user text>"}
+    plus, from turn 2 on, TOP-LEVEL "restoreFromStateId": <previous turn's id>
+    result: the assistant's reply (string)
+
+Continuity is CHAINED, not keyed: every turn sends a fresh id (the platform
+deprecates reusing inputs.id across kickoffs — it corrupts traces, the
+executions list, and metrics) and hydrates the previous turn's persisted
+state via restoreFromStateId. Omit restoreFromStateId to start fresh.
 """
 
 from __future__ import annotations
 
 import re
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from crewai import LLM, Flow
-from crewai.experimental.conversational import ConversationConfig, ConversationState
-from crewai.flow import listen
+from crewai.flow.flow import listen, router, start
 from crewai.flow.persistence import persist
 
 from audio_quickstart.agents import build_data_agent, build_form_agent
@@ -49,15 +48,6 @@ from audio_quickstart.forms import FORM_SCHEMAS
 
 _QUIT_RE = re.compile(r"\b(quit|exit|goodbye|bye)\b", re.IGNORECASE)
 _CANCEL_RE = re.compile(r"\b(cancel|abort)\b", re.IGNORECASE)
-_FORM_CLOSED_RE = re.compile(
-    r"form cancelled|mock submit ok|report (has been )?filed",
-    re.IGNORECASE,
-)
-_FORM_INTENT_LABELS = frozenset({"START_FORM", "FORM"})
-_FORM_MENTIONS = (
-    (re.compile(r"mainten\w*\s+report|maintenance_report", re.IGNORECASE), "maintenance_report"),
-    (re.compile(r"incident\s+report|incident_report", re.IGNORECASE), "incident_report"),
-)
 
 _FORM_TOKENS = "\n".join(
     f"- start_form:{ft}  — user wants to fill in: {schema.title}"
@@ -83,28 +73,20 @@ _UNKNOWN_REPLY = ("I'm not sure what you'd like to do. You can ask about asset "
 _MAX_TURNS = 10  # history depth (pairs)
 
 
-class AssistantState(ConversationState):
-    """Framework chat fields (id, messages, current_user_message, …) plus the
-    form wizard. `message` is the AMP /kickoff input; handle_turn uses
-    current_user_message instead."""
+class AssistantState(BaseModel):
+    """Serializable session state — `id` is the @persist restore key."""
 
+    id: str = ""
     message: str = ""
+    history: list[dict] = Field(default_factory=list)  # {role, content}
     active_mode: str | None = None                     # None | "form"
     form_type: str | None = None
     form_data: dict = Field(default_factory=dict)      # mirror of FormSession.data
 
 
-# AMP chat runs one kickoff process per /message and never calls
-# finalize_session_traces(). Deferring FlowFinished leaves those kickoffs
-# "live" with "Span orphaned — execution ended before completion event".
-# One-trace-per-session is for a long-lived in-process REPL; AMP already
-# treats each utterance as its own execution.
-@ConversationConfig(defer_trace_finalization=False)
 @persist()
 class AssistantFlow(Flow[AssistantState]):
-    """One handle_turn = one utterance. Live objects are rebuilt lazily per execution."""
-
-    conversational = True
+    """One kickoff = one turn. Live objects are rebuilt lazily per execution."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -113,21 +95,6 @@ class AssistantFlow(Flow[AssistantState]):
         self._form_agent = None
         self._form_session = None
         self._classifier_llm = LLM(model="openai/gpt-4o", temperature=0, timeout=30)
-
-    # -- AMP kickoff bridge -------------------------------------------------
-
-    def conversation_start(self) -> None:
-        """Hydrate a turn that arrived via AMP /kickoff rather than handle_turn.
-
-        handle_turn already sets current_user_message and appends the user
-        line. A raw kickoff only overlays inputs onto state (`id`, `message`),
-        so copy `message` into the conversational turn if needed.
-        """
-        incoming = (self.state.current_user_message or self.state.message or "").strip()
-        if incoming and not (self.state.current_user_message or "").strip():
-            self.receive_user_message(incoming)
-        if incoming:
-            self.state.message = incoming
 
     # -- lazy builders (state restores across pods; objects don't) ----------
 
@@ -149,110 +116,21 @@ class AssistantFlow(Flow[AssistantState]):
         self.state.form_data = {}
         self._form_agent = self._form_session = None
 
-    def _utterance(self) -> str:
-        return (self.state.current_user_message or self.state.message or "").strip()
+    # -- routing (deterministic first) ---------------------------------------
 
-    @staticmethod
-    def _msg_field(message, key, default=None):
-        if isinstance(message, dict):
-            return message.get(key, default)
-        return getattr(message, key, default)
+    @start()
+    def ingest(self) -> str:
+        return self.state.message or ""
 
-    def _form_checkpoint(self) -> dict:
-        return {
-            "active_mode": self.state.active_mode,
-            "form_type": self.state.form_type,
-            "form_data": dict(self.state.form_data or {}),
-        }
-
-    def _apply_form_checkpoint(self, checkpoint: dict) -> None:
-        form_type = checkpoint.get("form_type")
-        if form_type in FORM_SCHEMAS:
-            self.state.form_type = form_type
-        if checkpoint.get("form_data") and not self.state.form_data:
-            self.state.form_data = dict(checkpoint["form_data"])
-        if checkpoint.get("active_mode") == "form" or form_type in FORM_SCHEMAS:
-            self.state.active_mode = "form"
-
-    def _form_type_mentioned(self, text: str) -> str | None:
-        for needle, form_type in _FORM_MENTIONS:
-            if needle.search(text):
-                return form_type
-        lowered = text.lower()
-        for form_type, schema in FORM_SCHEMAS.items():
-            if schema.title.lower() in lowered:
-                return form_type
-        return None
-
-    def _infer_open_form(self) -> tuple[str | None, dict, bool]:
-        """Recover an in-progress wizard when AMP restored messages but not form fields."""
-        open_type = None
-        checkpoint: dict = {}
-        saw_form = False
-        for message in self.state.messages:
-            role = self._msg_field(message, "role")
-            content = self._msg_field(message, "content")
-            text = content if isinstance(content, str) else ""
-            metadata = self._msg_field(message, "metadata") or {}
-            stored = metadata.get("form") if isinstance(metadata, dict) else None
-            if isinstance(stored, dict) and stored.get("form_type") in FORM_SCHEMAS:
-                saw_form = True
-                open_type = stored["form_type"]
-                checkpoint = stored
-                continue
-            if role == "user" and _CANCEL_RE.search(text):
-                open_type = None
-                checkpoint = {}
-                continue
-            if role == "assistant" and _FORM_CLOSED_RE.search(text):
-                open_type = None
-                checkpoint = {}
-                continue
-            mentioned = self._form_type_mentioned(text)
-            if mentioned:
-                saw_form = True
-                open_type = mentioned
-        return open_type, checkpoint, saw_form
-
-    def _open_form(self) -> tuple[str | None, dict]:
-        """Form type to continue, plus any checkpoint recovered from history."""
-        inferred, checkpoint, saw_form = self._infer_open_form()
-        if inferred:
-            return inferred, checkpoint
-        if saw_form:
-            return None, {}
-        if self.state.active_mode == "form" and self.state.form_type in FORM_SCHEMAS:
-            return self.state.form_type, {}
-        if self.state.last_intent in _FORM_INTENT_LABELS and self.state.form_type in FORM_SCHEMAS:
-            return self.state.form_type, {}
-        return None, {}
-
-    def _continue_form(self, form_type: str, checkpoint: dict | None = None) -> None:
-        if checkpoint:
-            self._apply_form_checkpoint(checkpoint)
-        self.state.form_type = form_type
-        self.state.active_mode = "form"
-
-    def _reply_form(self, reply: str) -> str:
-        self.append_assistant_message(reply, metadata={"form": self._form_checkpoint()})
-        return reply
-
-    # -- routing (deterministic first; a returned label skips the LLM router)
-
-    def route_turn(self, context: dict) -> str:
-        del context
-        message = self._utterance()
+    @router(ingest)
+    def route(self) -> str:
+        message = self.state.message or ""
         if _QUIT_RE.search(message):
-            return "GOODBYE"
-        form_type, checkpoint = self._open_form()
-        if form_type or self.state.active_mode == "form":
-            if form_type:
-                self._continue_form(form_type, checkpoint)
+            return "END"
+        if self.state.active_mode == "form":
             if _CANCEL_RE.search(message):
                 return "CANCEL"
             return "FORM"
-        if _CANCEL_RE.search(message) and self._infer_open_form()[2]:
-            return "CANCEL"
         try:
             intent = str(self._classifier_llm.call(messages=[
                 {"role": "system", "content": _CLASSIFIER_SYSTEM},
@@ -268,20 +146,20 @@ class AssistantFlow(Flow[AssistantState]):
                 self.state.form_type = form_type
                 return "START_FORM"
         if intent == "quit":
-            return "GOODBYE"
+            return "END"
         return "UNKNOWN"
 
     # -- helpers --------------------------------------------------------------
 
     def _context(self) -> list[dict]:
-        """Canonical chat history for the agents (user line already appended)."""
-        lines: list[dict] = []
-        for message in self.state.messages[-_MAX_TURNS * 2:]:
-            role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
-            content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
-            if role in {"user", "assistant"} and isinstance(content, str) and content:
-                lines.append({"role": role, "content": content})
-        return lines
+        return [*self.state.history[-_MAX_TURNS * 2:],
+                {"role": "user", "content": self.state.message}]
+
+    def _finish(self, reply: str) -> str:
+        self.state.history.append({"role": "user", "content": self.state.message})
+        self.state.history.append({"role": "assistant", "content": reply})
+        self.state.history = self.state.history[-_MAX_TURNS * 2:]
+        return reply
 
     def _run_form(self) -> str:
         agent = self._form()
@@ -291,47 +169,32 @@ class AssistantFlow(Flow[AssistantState]):
             self._clear_form()
         return reply
 
-    # -- handlers (method name ≠ route label, or the graph re-triggers) ------
+    # -- handlers -------------------------------------------------------------
 
     @listen("ASSET_DATA")
-    def handle_asset_data(self) -> str:
-        """Questions about asset readings, output, energy, runtime, or which assets exist."""
-        reply = str(self._data().kickoff(self._context()))
-        self.append_assistant_message(reply)
-        return reply
+    def asset_data_turn(self) -> str:
+        return self._finish(str(self._data().kickoff(self._context())))
 
     @listen("START_FORM")
-    def handle_start_form(self) -> str:
-        """User wants to file a maintenance or incident report — start the wizard."""
+    def start_form_turn(self) -> str:
         self._form_agent = self._form_session = None
         self.state.active_mode = "form"
         self.state.form_data = {}
-        reply = self._run_form()
-        return self._reply_form(reply)
+        return self._finish(self._run_form())
 
     @listen("FORM")
-    def handle_form(self) -> str:
-        """Continue the in-progress voice-guided form (one field per turn)."""
-        reply = self._run_form()
-        return self._reply_form(reply)
+    def form_turn(self) -> str:
+        return self._finish(self._run_form())
 
     @listen("CANCEL")
-    def handle_cancel(self) -> str:
-        """Abort the in-progress form and return to the open assistant."""
+    def cancel_turn(self) -> str:
         self._clear_form()
-        reply = "Form cancelled. How can I help you?"
-        self.append_assistant_message(reply)
-        return reply
+        return self._finish("Form cancelled. How can I help you?")
 
-    @listen("GOODBYE")
-    def handle_goodbye(self) -> str:
-        """User is done with this conversation."""
-        reply = "Goodbye."
-        self.append_assistant_message(reply)
-        return reply
+    @listen("END")
+    def end_turn(self) -> str:
+        return self._finish("Goodbye.")
 
     @listen("UNKNOWN")
-    def handle_unknown(self) -> str:
-        """Off-topic, greeting, or unclear — point the user at what we can do."""
-        self.append_assistant_message(_UNKNOWN_REPLY)
-        return _UNKNOWN_REPLY
+    def unknown_turn(self) -> str:
+        return self._finish(_UNKNOWN_REPLY)

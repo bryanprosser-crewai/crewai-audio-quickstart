@@ -1,9 +1,9 @@
 # crewai-audio-quickstart
 
 **A voice-ready, conversational field assistant on CrewAI AMP — the full reference
-pattern:** audio → transcription → a conversational Flow (`handle_turn`, same
-session id) with intent routing, tool-using agents, and session memory → answer
-(text you can speak back).
+pattern:** audio → transcription → a deployed Flow with intent routing, tool-using
+agents, and session memory that survives across kickoffs → answer (text you can
+speak back).
 
 The flow mirrors an architecture running in real field deployments, with every
 customer-specific piece swapped for a generic, self-contained stand-in (the data
@@ -17,16 +17,12 @@ audio file / mic ──► OpenAI transcription — the CLIENT's key, used only 
                           │                 own OpenAI calls server-side with the
                           │                 key configured ON THE DEPLOYMENT.)
                           ▼
-             POST {deployment}/chat/start              → session_id  (once)
-             POST {deployment}/chat/{session_id}/message
-               {"message": "<transcript>", "stream": true}
+             POST {deployment}/kickoff
+               {"inputs": {"id": "<fresh uuid>", "message": "..."},
+                "restoreFromStateId": "<previous turn's id>"}   ← from turn 2 on
                           │
                           ▼
-             GET  {deployment}/chat/{session_id}/stream/events
-               SSE until turn_completed (token frames as they arrive)
-                          │
-                          ▼
-        AssistantFlow  (conversational=True; one handle_turn / kickoff = one utterance)
+        AssistantFlow  (one kickoff = one conversational turn)
         ├─ deterministic-first router: quit / cancel / form-continuation
         │  are handled with ZERO LLM calls; everything else gets one small
         │  classification call (asset_data | start_form:<type> | unknown)
@@ -37,24 +33,18 @@ audio file / mic ──► OpenAI transcription — the CLIENT's key, used only 
         ├─ Form agent — voice-guided wizard (maintenance / incident report):
         │    one field per turn, typed validation, read-back, explicit
         │    "confirm" before a (mock) submission
-        └─ ConversationState + @persist keyed on `id`: messages + form progress
-           survive across turns (on AMP SaaS, state lands on the persistent
-           volume by default)
+        └─ @persist state keyed on `id`: history + form progress survive
+           across kickoff executions (on AMP SaaS, state lands on the
+           persistent volume by default)
 ```
 
-**Session contract:** locally, `flow.handle_turn(message, session_id=S)`. On AMP,
-`POST /chat/start` creates `S`, then each utterance is
-`POST /chat/{S}/message` with `{"message": "<text>", "stream": true}`. The
-client attaches to `GET /chat/{S}/stream/events` and waits for
-`turn_completed` (token frames paint as they arrive). A new conversation is a
-new `/chat/start`. Canned replies that emit no tokens fall back to
-`GET /chat/{S}/history`.
-
-This is CrewAI AMP's conversational chat API (same shape as the ClickHouse
-dashboards gateway). The previous `/kickoff` + `restoreFromStateId` chain is gone.
-Each `/message` is its own AMP execution, so the Flow emits `FlowFinished` per
-turn (`defer_trace_finalization=False`). Deferring that event leaves kickoffs
-stuck "live" with orphaned spans — AMP never calls `finalize_session_traces()`.
+**Session contract:** each turn sends `{"id": "<FRESH uuid>", "message": "<text>"}`
+plus — from turn 2 on — top-level `"restoreFromStateId": "<previous turn's id>"`;
+the reply is a string. Continuity is **chained, not keyed**: never reuse an id
+across kickoffs (the platform deprecates it — it corrupts traces, the executions
+list, and metrics), and only advance the chain after a turn succeeds. Omit
+`restoreFromStateId` for a new conversation. Ids must be full, valid UUIDs
+(an AMP-side rule — locally any string works, so you'll only hit the 422 there).
 
 ## Deploy (CrewAI AMP)
 
@@ -73,11 +63,11 @@ cp .env.example .env         # fill in the two deployment values
 python3 client/ask.py samples/question.wav
 ```
 
-`client/ask.py` is stdlib-only and does the AMP chat loop: transcribe →
-`/chat/start` (or reuse `.session`) → `/chat/{id}/message` → SSE
-`/chat/{id}/stream/events` → print token text (or `/history` if none).
-Consecutive clips continue ONE conversation — which is what makes the form
-wizard work by voice:
+`client/ask.py` is stdlib-only and does the whole loop: transcribe → discover the
+deployment's input contract (`GET /inputs` — never assume key names) → kickoff →
+poll → print. It keeps a `.session` file holding the previous turn's id and chains
+each run to it via `restoreFromStateId`, so consecutive questions continue ONE
+conversation — which is what makes the form wizard work by voice:
 
 ```bash
 python3 client/ask.py clips/file-a-report.wav      # "I'd like to file a maintenance report"
@@ -99,8 +89,8 @@ produces wav/mp3/m4a.
 ## Browser client (`ui/`)
 
 A fully client-side web UI (Rust/Leptos → WASM): paste your deployment URL,
-bearer token, and OpenAI key, then talk — mic capture → transcription → AMP chat
-SSE turn → spoken reply via the browser's speech synthesis. The three values are stored only
+bearer token, and OpenAI key, then talk — mic capture → transcription → kickoff →
+spoken reply via the browser's speech synthesis. The three values are stored only
 in your browser's localStorage; the browser sends the deployment values only to
 your deployment endpoint and the OpenAI key only to OpenAI's transcription API.
 (The deployed flow's agents use the key configured on the deployment — the
@@ -115,8 +105,7 @@ browser key does transcription and nothing else.) See
 
 ```bash
 uv sync
-OPENAI_API_KEY=sk-... uv run kickoff     # scripted 3-turn smoke session (handle_turn)
-OPENAI_API_KEY=sk-... uv run chat        # interactive terminal REPL
+OPENAI_API_KEY=sk-... uv run kickoff     # scripted 3-turn smoke session
 ```
 
 The data layer (`src/audio_quickstart/data.py`) seeds deterministic synthetic
@@ -128,13 +117,13 @@ don't change.
 
 ```
 src/audio_quickstart/
-├── flow.py      # AssistantFlow: conversational router + handlers + @persist
+├── flow.py      # AssistantFlow: router + handlers + @persist session state
 ├── agents.py    # data agent + form agent (one LLM instance per agent)
 ├── tools.py     # 3 data tools (SQLite) + 3 form tools; caching disabled
 ├── forms.py     # form schemas, typed validation, session state machine
 ├── data.py      # synthetic SQLite readings (the stubbed "warehouse")
-└── main.py      # local smoke (handle_turn) + chat() REPL
-client/ask.py    # stdlib audio client (transcribe → AMP chat turn → SSE)
+└── main.py      # local smoke entry point
+client/ask.py    # stdlib audio client (transcribe → kickoff → poll)
 ui/              # Leptos (Rust/WASM) browser client
 ```
 

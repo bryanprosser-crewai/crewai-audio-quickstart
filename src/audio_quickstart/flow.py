@@ -96,7 +96,8 @@ class AssistantState(ConversationState):
 
 # AMP chat runs one kickoff process per /message and never calls
 # finalize_session_traces(). Deferring FlowFinished leaves those kickoffs
-# "live" with "Span orphaned — execution ended before completion event".
+# Pending — the chat worker often sets instance `defer_trace_finalization=True`
+# even when ConversationConfig says False, and that attr is checked first.
 # One-trace-per-session is for a long-lived in-process REPL; AMP already
 # treats each utterance as its own execution.
 @ConversationConfig(defer_trace_finalization=False)
@@ -105,14 +106,20 @@ class AssistantFlow(Flow[AssistantState]):
     """One handle_turn = one utterance. Live objects are rebuilt lazily per execution."""
 
     conversational = True
+    defer_trace_finalization = False
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
+        self.defer_trace_finalization = False
         self._conn = None
         self._data_agent = None
         self._form_agent = None
         self._form_session = None
         self._classifier_llm = LLM(model="openai/gpt-4o", temperature=0, timeout=30)
+
+    def _should_defer_trace_finalization(self) -> bool:
+        """AMP never finalizes the session; always emit FlowFinished per turn."""
+        return False
 
     # -- AMP kickoff bridge -------------------------------------------------
 
@@ -123,6 +130,7 @@ class AssistantFlow(Flow[AssistantState]):
         line. A raw kickoff only overlays inputs onto state (`id`, `message`),
         so copy `message` into the conversational turn if needed.
         """
+        self.defer_trace_finalization = False
         incoming = (self.state.current_user_message or self.state.message or "").strip()
         if incoming and not (self.state.current_user_message or "").strip():
             self.receive_user_message(incoming)

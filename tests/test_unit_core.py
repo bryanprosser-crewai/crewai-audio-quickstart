@@ -207,6 +207,7 @@ def test_router_cancel_from_history_without_persisted_mode(flow):
 
 def test_amp_turns_finalize_their_own_traces(flow):
     """AMP /message is one kickoff process; it never calls finalize_session_traces."""
+    flow.defer_trace_finalization = True  # AMP chat worker typically sets this
     assert flow._should_defer_trace_finalization() is False
 
 

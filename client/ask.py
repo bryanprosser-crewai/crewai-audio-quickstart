@@ -224,10 +224,15 @@ def kickoff(base: str, token: str, inputs: dict,
 
 
 def wait_for_answer(base: str, token: str, kickoff_id: str,
-                    timeout_s: int = 300, poll_s: float = 3.0) -> str:
-    """Poll /status/{kickoff_id} until the run reaches a terminal state."""
+                    timeout_s: int = 300, poll_s: float = 0.4) -> str:
+    """Poll /status/{kickoff_id} until the run reaches a terminal state.
+
+    Starts at ``poll_s`` (default 400ms) and backs off ×1.5 to a 2s cap so a
+    typical turn is noticed quickly without a tight /status loop forever.
+    """
     deadline = time.monotonic() + timeout_s
     last_state = ""
+    delay = poll_s
     while time.monotonic() < deadline:
         data = http("GET", f"{base}/status/{kickoff_id}", token)
         state = str(data.get("state", data.get("status", ""))).upper()
@@ -238,7 +243,8 @@ def wait_for_answer(base: str, token: str, kickoff_id: str,
             return str(data.get("result") or data.get("result_json") or data)
         if state in FAILURE_STATES:
             sys.exit(f"Run failed:\n{json.dumps(data, indent=2)}")
-        time.sleep(poll_s)
+        time.sleep(delay)
+        delay = min(delay * 1.5, 2.0)
     sys.exit(f"Timed out after {timeout_s}s waiting for {kickoff_id}")
 
 

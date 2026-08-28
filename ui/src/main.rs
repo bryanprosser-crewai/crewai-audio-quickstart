@@ -93,6 +93,9 @@ async fn kickoff(
 
 async fn poll_result(cfg: &Settings, kickoff_id: &str) -> Result<String, String> {
     let url = format!("{}/status/{}", cfg.deployment_url.trim_end_matches('/'), kickoff_id);
+    // Immediate first check, then backoff: 400ms → 600 → 900 → 1.35s → cap 2s.
+    // Catches typical 4–6s turns within ~400ms of finish without a /status storm.
+    let mut delay_ms: u32 = 400;
     for _ in 0..100 {
         let resp = gloo_net::http::Request::get(&url)
             .header("Authorization", &format!("Bearer {}", cfg.deployment_token))
@@ -111,7 +114,10 @@ async fn poll_result(cfg: &Settings, kickoff_id: &str) -> Result<String, String>
             "FAILED" | "FAILURE" | "ERROR" | "CANCELLED" => {
                 return Err(format!("run ended in {state}: {v}"));
             }
-            _ => gloo_timers::future::TimeoutFuture::new(2_500).await,
+            _ => {
+                gloo_timers::future::TimeoutFuture::new(delay_ms).await;
+                delay_ms = delay_ms.saturating_mul(3).saturating_div(2).min(2_000);
+            }
         }
     }
     Err("timed out waiting for the run".into())

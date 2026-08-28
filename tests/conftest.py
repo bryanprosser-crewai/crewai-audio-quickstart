@@ -132,5 +132,5 @@ def run_turn(dep: dict, message: str, turn_id: str | None = None,
             return turn_id, str(status.get("result", ""))
         if state in {"FAILED", "FAILURE", "ERROR", "CANCELLED"}:
             raise AssertionError(f"execution {kid} failed: {status}")
-        time.sleep(1.5)
+        time.sleep(0.1)
     raise AssertionError(f"timed out waiting for execution {kid}")

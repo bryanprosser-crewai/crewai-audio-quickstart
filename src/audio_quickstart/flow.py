@@ -48,6 +48,15 @@ from audio_quickstart.forms import FORM_SCHEMAS
 
 _QUIT_RE = re.compile(r"\b(quit|exit|goodbye|bye)\b", re.IGNORECASE)
 _CANCEL_RE = re.compile(r"\b(cancel|abort)\b", re.IGNORECASE)
+_FORM_CLOSED_RE = re.compile(
+    r"form cancelled|mock submit ok|report (has been )?filed",
+    re.IGNORECASE,
+)
+_FORM_INTENT_LABELS = frozenset({"START_FORM", "FORM"})
+_FORM_MENTIONS = (
+    (re.compile(r"mainten\w*\s+report|maintenance_report", re.IGNORECASE), "maintenance_report"),
+    (re.compile(r"incident\s+report|incident_report", re.IGNORECASE), "incident_report"),
+)
 
 _FORM_TOKENS = "\n".join(
     f"- start_form:{ft}  — user wants to fill in: {schema.title}"
@@ -142,6 +151,91 @@ class AssistantFlow(Flow[AssistantState]):
     def _utterance(self) -> str:
         return (self.state.current_user_message or self.state.message or "").strip()
 
+    @staticmethod
+    def _msg_field(message, key, default=None):
+        if isinstance(message, dict):
+            return message.get(key, default)
+        return getattr(message, key, default)
+
+    def _form_checkpoint(self) -> dict:
+        return {
+            "active_mode": self.state.active_mode,
+            "form_type": self.state.form_type,
+            "form_data": dict(self.state.form_data or {}),
+        }
+
+    def _apply_form_checkpoint(self, checkpoint: dict) -> None:
+        form_type = checkpoint.get("form_type")
+        if form_type in FORM_SCHEMAS:
+            self.state.form_type = form_type
+        if checkpoint.get("form_data") and not self.state.form_data:
+            self.state.form_data = dict(checkpoint["form_data"])
+        if checkpoint.get("active_mode") == "form" or form_type in FORM_SCHEMAS:
+            self.state.active_mode = "form"
+
+    def _form_type_mentioned(self, text: str) -> str | None:
+        for needle, form_type in _FORM_MENTIONS:
+            if needle.search(text):
+                return form_type
+        lowered = text.lower()
+        for form_type, schema in FORM_SCHEMAS.items():
+            if schema.title.lower() in lowered:
+                return form_type
+        return None
+
+    def _infer_open_form(self) -> tuple[str | None, dict, bool]:
+        """Recover an in-progress wizard when AMP restored messages but not form fields."""
+        open_type = None
+        checkpoint: dict = {}
+        saw_form = False
+        for message in self.state.messages:
+            role = self._msg_field(message, "role")
+            content = self._msg_field(message, "content")
+            text = content if isinstance(content, str) else ""
+            metadata = self._msg_field(message, "metadata") or {}
+            stored = metadata.get("form") if isinstance(metadata, dict) else None
+            if isinstance(stored, dict) and stored.get("form_type") in FORM_SCHEMAS:
+                saw_form = True
+                open_type = stored["form_type"]
+                checkpoint = stored
+                continue
+            if role == "user" and _CANCEL_RE.search(text):
+                open_type = None
+                checkpoint = {}
+                continue
+            if role == "assistant" and _FORM_CLOSED_RE.search(text):
+                open_type = None
+                checkpoint = {}
+                continue
+            mentioned = self._form_type_mentioned(text)
+            if mentioned:
+                saw_form = True
+                open_type = mentioned
+        return open_type, checkpoint, saw_form
+
+    def _open_form(self) -> tuple[str | None, dict]:
+        """Form type to continue, plus any checkpoint recovered from history."""
+        inferred, checkpoint, saw_form = self._infer_open_form()
+        if inferred:
+            return inferred, checkpoint
+        if saw_form:
+            return None, {}
+        if self.state.active_mode == "form" and self.state.form_type in FORM_SCHEMAS:
+            return self.state.form_type, {}
+        if self.state.last_intent in _FORM_INTENT_LABELS and self.state.form_type in FORM_SCHEMAS:
+            return self.state.form_type, {}
+        return None, {}
+
+    def _continue_form(self, form_type: str, checkpoint: dict | None = None) -> None:
+        if checkpoint:
+            self._apply_form_checkpoint(checkpoint)
+        self.state.form_type = form_type
+        self.state.active_mode = "form"
+
+    def _reply_form(self, reply: str) -> str:
+        self.append_assistant_message(reply, metadata={"form": self._form_checkpoint()})
+        return reply
+
     # -- routing (deterministic first; a returned label skips the LLM router)
 
     def route_turn(self, context: dict) -> str:
@@ -149,10 +243,15 @@ class AssistantFlow(Flow[AssistantState]):
         message = self._utterance()
         if _QUIT_RE.search(message):
             return "GOODBYE"
-        if self.state.active_mode == "form":
+        form_type, checkpoint = self._open_form()
+        if form_type or self.state.active_mode == "form":
+            if form_type:
+                self._continue_form(form_type, checkpoint)
             if _CANCEL_RE.search(message):
                 return "CANCEL"
             return "FORM"
+        if _CANCEL_RE.search(message) and self._infer_open_form()[2]:
+            return "CANCEL"
         try:
             intent = str(self._classifier_llm.call(messages=[
                 {"role": "system", "content": _CLASSIFIER_SYSTEM},
@@ -207,15 +306,13 @@ class AssistantFlow(Flow[AssistantState]):
         self.state.active_mode = "form"
         self.state.form_data = {}
         reply = self._run_form()
-        self.append_assistant_message(reply)
-        return reply
+        return self._reply_form(reply)
 
     @listen("FORM")
     def handle_form(self) -> str:
         """Continue the in-progress voice-guided form (one field per turn)."""
         reply = self._run_form()
-        self.append_assistant_message(reply)
-        return reply
+        return self._reply_form(reply)
 
     @listen("CANCEL")
     def handle_cancel(self) -> str:

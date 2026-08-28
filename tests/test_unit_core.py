@@ -159,6 +159,52 @@ def test_router_form_mode_continues(flow):
     assert flow.route_turn({}) == "FORM"
 
 
+def test_router_resumes_form_from_last_intent_when_mode_dropped(flow):
+    """AMP chat often restores ConversationState.last_intent but not extra fields."""
+    flow.state.last_intent = "START_FORM"
+    flow.state.form_type = "maintenance_report"
+    flow.state.active_mode = None
+    flow.state.current_user_message = "PUMP A1"
+    assert flow.route_turn({}) == "FORM"
+    assert flow.state.active_mode == "form"
+
+
+def test_router_resumes_form_from_history_when_state_dropped(flow):
+    """AMP history is visible even when active_mode / form_type did not persist."""
+    flow.state.active_mode = None
+    flow.state.form_type = None
+    flow.state.last_intent = None
+    flow.state.messages = [
+        {"role": "user", "content": "I want to log a maintenance report"},
+        {"role": "assistant", "content": "Starting the Maintenance Report. What's the Asset ID?"},
+    ]
+    flow.state.current_user_message = "PUMP A1"
+    assert flow.route_turn({}) == "FORM"
+    assert flow.state.form_type == "maintenance_report"
+    assert flow.state.active_mode == "form"
+
+
+def test_router_does_not_resume_form_after_cancel_in_history(flow):
+    flow.state.messages = [
+        {"role": "user", "content": "I'd like to file a maintenance report"},
+        {"role": "assistant", "content": "What's the Asset ID?"},
+        {"role": "user", "content": "cancel that"},
+        {"role": "assistant", "content": "Form cancelled. How can I help you?"},
+    ]
+    flow.state.current_user_message = "PUMP A1"
+    assert flow._open_form()[0] is None
+
+
+def test_router_cancel_from_history_without_persisted_mode(flow):
+    flow.state.messages = [
+        {"role": "user", "content": "I'd like to file a maintenance report"},
+        {"role": "assistant", "content": "Starting the Maintenance Report. What's the Asset ID?"},
+        {"role": "user", "content": "cancel that"},
+    ]
+    flow.state.current_user_message = "cancel that"
+    assert flow.route_turn({}) == "CANCEL"
+
+
 def test_amp_turns_finalize_their_own_traces(flow):
     """AMP /message is one kickoff process; it never calls finalize_session_traces."""
     assert flow._should_defer_trace_finalization() is False

@@ -43,6 +43,16 @@ def test_session_id_carries_context(deployment):
         "later turns on the same session id must still see the history"
 
 
+def test_form_wizard_continues_on_same_session(deployment):
+    sid, reply1 = run_turn(deployment, "I'd like to file a maintenance report.")
+    assert "asset" in reply1.lower()
+    _, reply2 = run_turn(deployment, "PUMP A1", session_id=sid)
+    lowered = reply2.lower()
+    assert "form cancelled" not in lowered
+    assert "kwh" not in lowered, "turn 2 must stay in the form, not re-route to asset data"
+    assert any(token in lowered for token in ("work", "done", "asset", "pump a1"))
+
+
 def test_deterministic_turn_no_llm(deployment):
     _, reply = run_turn(deployment, "goodbye")
     assert "goodbye" in reply.lower()

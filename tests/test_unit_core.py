@@ -159,6 +159,11 @@ def test_router_form_mode_continues(flow):
     assert flow.route_turn({}) == "FORM"
 
 
+def test_amp_turns_finalize_their_own_traces(flow):
+    """AMP /message is one kickoff process; it never calls finalize_session_traces."""
+    assert flow._should_defer_trace_finalization() is False
+
+
 def test_conversation_start_hydrates_amp_kickoff_message(flow):
     """AMP /kickoff overlays `message`; handle_turn is not in that path."""
     flow.state.message = "cancel that"

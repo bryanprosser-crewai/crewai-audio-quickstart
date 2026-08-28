@@ -45,6 +45,9 @@ new `/chat/start`. The reply is a string (also on `GET /chat/{S}/history`).
 
 This is CrewAI AMP's conversational chat API (same shape as the ClickHouse
 dashboards gateway). The previous `/kickoff` + `restoreFromStateId` chain is gone.
+Each `/message` is its own AMP execution, so the Flow emits `FlowFinished` per
+turn (`defer_trace_finalization=False`). Deferring that event leaves kickoffs
+stuck "live" with orphaned spans — AMP never calls `finalize_session_traces()`.
 
 ## Deploy (CrewAI AMP)
 

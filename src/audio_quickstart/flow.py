@@ -84,7 +84,12 @@ class AssistantState(ConversationState):
     form_data: dict = Field(default_factory=dict)      # mirror of FormSession.data
 
 
-@ConversationConfig(defer_trace_finalization=True)
+# AMP chat runs one kickoff process per /message and never calls
+# finalize_session_traces(). Deferring FlowFinished leaves those kickoffs
+# "live" with "Span orphaned — execution ended before completion event".
+# One-trace-per-session is for a long-lived in-process REPL; AMP already
+# treats each utterance as its own execution.
+@ConversationConfig(defer_trace_finalization=False)
 @persist()
 class AssistantFlow(Flow[AssistantState]):
     """One handle_turn = one utterance. Live objects are rebuilt lazily per execution."""

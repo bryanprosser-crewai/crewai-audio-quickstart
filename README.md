@@ -17,9 +17,10 @@ audio file / mic ──► OpenAI transcription — the CLIENT's key, used only 
                           │                 own OpenAI calls server-side with the
                           │                 key configured ON THE DEPLOYMENT.)
                           ▼
-             POST {deployment}/kickoff
-               {"inputs": {"id": "<session uuid>", "message": "..."}}
-                          │  reuse the SAME id every turn of a conversation
+             POST {deployment}/chat/start              → session_id  (once)
+             POST {deployment}/chat/{session_id}/message
+               {"message": "<transcript>"}             → one turn
+                          │
                           ▼
         AssistantFlow  (conversational=True; one handle_turn / kickoff = one utterance)
         ├─ deterministic-first router: quit / cancel / form-continuation
@@ -37,13 +38,13 @@ audio file / mic ──► OpenAI transcription — the CLIENT's key, used only 
            volume by default)
 ```
 
-**Session contract:** each turn sends `{"id": "<session uuid>", "message": "<text>"}`.
-Reuse that id for the whole conversation — locally via `flow.handle_turn(message,
-session_id=S)`, on AMP via `/kickoff` with the same `inputs.id`. A new conversation
-is a new id. Ids must be full, valid UUIDs (an AMP-side rule). The reply is a string.
+**Session contract:** locally, `flow.handle_turn(message, session_id=S)`. On AMP,
+`POST /chat/start` creates `S`, then each utterance is
+`POST /chat/{S}/message` with `{"message": "<text>"}`. A new conversation is a
+new `/chat/start`. The reply is a string (also on `GET /chat/{S}/history`).
 
-This is CrewAI's conversational Flow model (same shape as the ClickHouse dashboards
-example). The previous `restoreFromStateId` chain — a fresh UUID per turn — is gone.
+This is CrewAI AMP's conversational chat API (same shape as the ClickHouse
+dashboards gateway). The previous `/kickoff` + `restoreFromStateId` chain is gone.
 
 ## Deploy (CrewAI AMP)
 
@@ -62,11 +63,10 @@ cp .env.example .env         # fill in the two deployment values
 python3 client/ask.py samples/question.wav
 ```
 
-`client/ask.py` is stdlib-only and does the whole loop: transcribe → discover the
-deployment's input contract (`GET /inputs` — never assume key names) → kickoff →
-poll → print. It keeps a `.session` file holding the conversation's session id so
-consecutive questions continue ONE conversation — which is what makes the form
-wizard work by voice:
+`client/ask.py` is stdlib-only and does the AMP chat loop: transcribe →
+`/chat/start` (or reuse `.session`) → `/chat/{id}/message` → poll `/status` →
+print the last assistant line from `/history`. Consecutive clips continue ONE
+conversation — which is what makes the form wizard work by voice:
 
 ```bash
 python3 client/ask.py clips/file-a-report.wav      # "I'd like to file a maintenance report"
@@ -88,8 +88,8 @@ produces wav/mp3/m4a.
 ## Browser client (`ui/`)
 
 A fully client-side web UI (Rust/Leptos → WASM): paste your deployment URL,
-bearer token, and OpenAI key, then talk — mic capture → transcription → kickoff →
-spoken reply via the browser's speech synthesis. The three values are stored only
+bearer token, and OpenAI key, then talk — mic capture → transcription → AMP chat
+turn → spoken reply via the browser's speech synthesis. The three values are stored only
 in your browser's localStorage; the browser sends the deployment values only to
 your deployment endpoint and the OpenAI key only to OpenAI's transcription API.
 (The deployed flow's agents use the key configured on the deployment — the
@@ -123,7 +123,7 @@ src/audio_quickstart/
 ├── forms.py     # form schemas, typed validation, session state machine
 ├── data.py      # synthetic SQLite readings (the stubbed "warehouse")
 └── main.py      # local smoke (handle_turn) + chat() REPL
-client/ask.py    # stdlib audio client (transcribe → kickoff → poll)
+client/ask.py    # stdlib audio client (transcribe → AMP chat turn → poll)
 ui/              # Leptos (Rust/WASM) browser client
 ```
 

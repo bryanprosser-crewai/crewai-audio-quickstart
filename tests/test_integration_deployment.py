@@ -1,7 +1,7 @@
 """Integration tier — real kickoffs against the deployed flow (needs .env).
 
-Exercises the wire contract the clients depend on: single-turn answers and
-cross-turn session continuity via a reused session id (conversational Flow).
+Exercises the AMP chat contract the clients depend on: single-turn answers
+and cross-turn continuity via POST /chat/start + /chat/{id}/message.
 """
 
 from __future__ import annotations

@@ -16,8 +16,6 @@ import os
 import pathlib
 import time
 import urllib.request
-import uuid
-
 import pytest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -117,16 +115,27 @@ def _request(url: str, token: str, payload: dict | None = None) -> dict:
 
 def run_turn(dep: dict, message: str, session_id: str | None = None,
              timeout_s: int = 240) -> tuple[str, str]:
-    """One kickoff → poll. Returns (session_id, result). Reuse the SAME
-    session_id across turns — the conversational Flow contract."""
-    session_id = session_id or str(uuid.uuid4())
-    body: dict = {"inputs": {"id": session_id, "message": message}}
-    kid = _request(f"{dep['url']}/kickoff", dep["token"], body)["kickoff_id"]
+    """One AMP chat turn → poll. Returns (session_id, result)."""
+    url, token = dep["url"], dep["token"]
+    if not session_id:
+        started = _request(f"{url}/chat/start", token, {})
+        session_id = str(started.get("session_id") or started.get("id") or "")
+        if not session_id:
+            raise AssertionError(f"POST /chat/start returned no session_id: {started}")
+    sent = _request(f"{url}/chat/{session_id}/message", token,
+                    {"message": message, "stream": False})
+    kid = sent.get("kickoff_id") or sent.get("id")
+    if not kid:
+        raise AssertionError(f"POST /chat/.../message returned no kickoff_id: {sent}")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        status = _request(f"{dep['url']}/status/{kid}", dep["token"])
+        status = _request(f"{url}/status/{kid}", token)
         state = str(status.get("state") or status.get("status") or "").upper()
         if state in {"SUCCESS", "SUCCEEDED", "COMPLETED", "COMPLETE", "FINISHED"}:
+            history = _request(f"{url}/chat/{session_id}/history", token)
+            for msg in reversed(history.get("messages") or []):
+                if isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("content"):
+                    return session_id, str(msg["content"])
             return session_id, str(status.get("result", ""))
         if state in {"FAILED", "FAILURE", "ERROR", "CANCELLED"}:
             raise AssertionError(f"execution {kid} failed: {status}")

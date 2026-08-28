@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Audio in, answer out — against a deployed CrewAI conversational flow.
+"""Audio in, answer out — one chat turn against a deployed conversational Flow.
 
-The whole path, in four steps:
+AMP chat API (see https://docs-platform.crewai.com/platform/en/guides/conversational-flow-chat):
 
-    1. TRANSCRIBE  audio file -> text, via OpenAI's transcription API
-                   (this is the ONLY step that needs an OpenAI API key)
-    2. DISCOVER    GET {deployment}/inputs -> the exact input keys the
-                   deployment expects (never assume them)
-    3. KICKOFF     POST {deployment}/kickoff with
-                   {"inputs": {"id": <session id>, "message": <transcript>}}
-                   Reuse the SAME id every turn of a conversation. A new
-                   conversation is a new id (--new-session).
-    4. POLL        GET {deployment}/status/{kickoff_id} until it finishes
+    1. TRANSCRIBE   audio file -> text, via OpenAI's transcription API
+                    (this is the ONLY step that needs an OpenAI API key)
+    2. SESSION      POST {deployment}/chat/start  -> session_id
+                    (reused from .session on later turns; --new-session starts over)
+    3. MESSAGE      POST {deployment}/chat/{session_id}/message
+                    {"message": "<transcript>"}  -> kickoff_id
+    4. POLL         GET  {deployment}/status/{kickoff_id} until it finishes
+    5. HISTORY      GET  {deployment}/chat/{session_id}/history  -> last assistant line
 
 Usage:
 
     python3 client/ask.py samples/question.wav
+
+Requires GET /inspect to report flow.chat.conversational and handle_turn.
+Confirm with:  python3 client/ask.py --inspect
 
 Configuration (env vars, or a local .env file next to where you run this):
 
@@ -42,17 +44,11 @@ import urllib.request
 import uuid
 
 OPENAI_TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
+SESSION_FILE = ".session"
 
-# /status states, normalized to upper-case. Deployments report e.g.
-# PENDING -> RUNNING -> SUCCESS; be liberal in what we accept.
-RUNNING_STATES = {"PENDING", "QUEUED", "STARTED", "RUNNING", "PROCESSING"}
 SUCCESS_STATES = {"SUCCESS", "SUCCEEDED", "COMPLETED", "COMPLETE", "FINISHED"}
 FAILURE_STATES = {"FAILED", "FAILURE", "ERROR", "CANCELLED"}
 
-
-# --------------------------------------------------------------------------
-# small helpers
-# --------------------------------------------------------------------------
 
 def load_dotenv(path: str = ".env") -> None:
     """Minimal .env loader (KEY=VALUE lines). Real env vars win."""
@@ -68,7 +64,7 @@ def load_dotenv(path: str = ".env") -> None:
 
 
 def http(method: str, url: str, token: str, body: dict | None = None) -> dict:
-    """One JSON request to the deployment; explain auth/input errors clearly."""
+    """One JSON request to the deployment; explain auth/chat errors clearly."""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         url, data=data, method=method,
@@ -79,38 +75,40 @@ def http(method: str, url: str, token: str, body: dict | None = None) -> dict:
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read().decode())
+            raw = resp.read().decode()
+            return json.loads(raw) if raw.strip() else {}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
         if exc.code in (401, 403):
             sys.exit(
                 f"{exc.code} from {url}\n{detail}\n\n"
                 "Auth problem. Check CREWAI_DEPLOYMENT_TOKEN: it must be the "
-                "bearer token shown on THIS deployment's page in CrewAI AMP — "
-                "every deployment has its own token (and its own URL)."
+                "bearer token shown on THIS deployment's page in CrewAI AMP."
+            )
+        if exc.code == 404:
+            sys.exit(
+                f"404 from {url}\n{detail}\n\n"
+                "Chat is not available (or this session_id is unknown). "
+                "GET /inspect must show flow.chat.conversational and "
+                "handle_turn. Redeploy this conversational Flow, or pass "
+                "--new-session if the stored session expired."
+            )
+        if exc.code == 409:
+            sys.exit(
+                f"409 from {url}\n{detail}\n\n"
+                "This session already has an active turn. Wait for it to "
+                "finish (or start --new-session) before sending another clip."
             )
         if exc.code == 422:
             sys.exit(
                 f"422 from {url}\n{detail}\n\n"
-                "The deployment rejected the request body. Two usual causes:\n"
-                "  1. Wrong input keys — run with --show-inputs to see the exact\n"
-                "     keys this deployment expects, and send exactly those.\n"
-                "  2. An id/session input that isn't a FULL, valid UUID —\n"
-                "     never truncate UUIDs."
+                "session_id must be a full, valid UUID — never truncate it."
             )
         sys.exit(f"{exc.code} from {url}\n{detail}")
 
 
-# --------------------------------------------------------------------------
-# step 1: audio -> text (OpenAI transcription API)
-# --------------------------------------------------------------------------
-
 def transcribe(path: str, api_key: str, model: str) -> str:
-    """Upload the audio file as multipart/form-data; return the transcript.
-
-    Accepts whatever the API accepts: wav, mp3, m4a, webm, flac, ogg...
-    Built by hand so the client stays dependency-free.
-    """
+    """Upload the audio file as multipart/form-data; return the transcript."""
     boundary = f"----audioquickstart{uuid.uuid4().hex}"
     content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
     with open(path, "rb") as fh:
@@ -144,83 +142,32 @@ def transcribe(path: str, api_key: str, model: str) -> str:
                  f"{exc.read().decode(errors='replace')}")
 
 
-# --------------------------------------------------------------------------
-# steps 2-4: discover inputs, kickoff, poll
-# --------------------------------------------------------------------------
-
-def discover_inputs(base: str, token: str) -> list[str]:
-    """GET /inputs — the deployment's actual input contract.
-
-    ALWAYS check this instead of assuming key names. Sending the wrong keys
-    (or missing one) is the #1 cause of 422s.
-    """
-    data = http("GET", f"{base}/inputs", token)
-    # Response is {"inputs": [...]} on current deployments; tolerate a bare list.
-    return data.get("inputs", data) if isinstance(data, dict) else data
+def inspect_chat(base: str, token: str) -> dict:
+    data = http("GET", f"{base}/inspect", token)
+    return ((data.get("flow") or {}).get("chat") or {})
 
 
-SESSION_FILE = ".session"  # stores the STABLE conversation session id
+def start_session(base: str, token: str) -> str:
+    data = http("POST", f"{base}/chat/start", token, body={})
+    sid = data.get("session_id") or data.get("id")
+    if not sid:
+        sys.exit(f"POST /chat/start returned no session_id: {data}")
+    return str(sid)
 
 
-def session_id(new: bool = False) -> str:
-    """Reuse one UUID for the whole conversation (CrewAI conversational
-    contract: same session id every turn). --new-session mints a fresh one."""
-    if not new and os.path.exists(SESSION_FILE):
-        stored = open(SESSION_FILE).read().strip()
-        try:
-            uuid.UUID(stored)
-            return stored
-        except ValueError:
-            pass
-    sid = str(uuid.uuid4())
-    with open(SESSION_FILE, "w") as fh:
-        fh.write(sid)
-    return sid
+def send_turn(base: str, token: str, session_id: str, message: str) -> str:
+    data = http(
+        "POST", f"{base}/chat/{session_id}/message", token,
+        body={"message": message, "stream": False},
+    )
+    kid = data.get("kickoff_id") or data.get("id")
+    if not kid:
+        sys.exit(f"POST /chat/.../message returned no kickoff_id: {data}")
+    return str(kid)
 
 
-def build_inputs(required: list[str], transcript: str, sid: str) -> dict:
-    """Map the transcript (plus the session id) onto the required keys.
-
-    Conversational deployments take `id` + `message`. Extra ConversationState
-    fields that show up in GET /inputs are left to their persisted defaults.
-    """
-    inputs: dict[str, str] = {}
-    names = {k for k in required} if isinstance(required, list) else set()
-    # Tolerate both a list of names and a list of {name: ...} dicts.
-    if required and isinstance(required[0], dict):
-        names = {str(item.get("name") or item.get("key") or "") for item in required}
-        names.discard("")
-
-    text_keys = [k for k in ("query", "question", "message", "text", "input") if k in names]
-    id_keys = [k for k in names if k == "id" or k.endswith("_id")]
-
-    for key in id_keys:
-        inputs[key] = sid
-
-    if text_keys:
-        inputs[text_keys[0]] = transcript
-    elif "message" in names or not names:
-        inputs.setdefault("id", sid)
-        inputs["message"] = transcript
-    elif len(names - set(inputs)) == 1:
-        inputs[next(k for k in names if k not in inputs)] = transcript
-    else:
-        # Still send the conversational contract — AMP overlays known fields.
-        inputs.setdefault("id", sid)
-        inputs["message"] = transcript
-    inputs.setdefault("id", sid)
-    inputs.setdefault("message", transcript)
-    return inputs
-
-
-def kickoff(base: str, token: str, inputs: dict) -> str:
-    data = http("POST", f"{base}/kickoff", token, body={"inputs": inputs})
-    return data["kickoff_id"]
-
-
-def wait_for_answer(base: str, token: str, kickoff_id: str,
-                    timeout_s: int = 300, poll_s: float = 3.0) -> str:
-    """Poll /status/{kickoff_id} until the run reaches a terminal state."""
+def wait_for_turn(base: str, token: str, kickoff_id: str,
+                  timeout_s: int = 300, poll_s: float = 3.0) -> dict:
     deadline = time.monotonic() + timeout_s
     last_state = ""
     while time.monotonic() < deadline:
@@ -230,14 +177,39 @@ def wait_for_answer(base: str, token: str, kickoff_id: str,
             print(f"   state: {state or '?'}", file=sys.stderr)
             last_state = state
         if state in SUCCESS_STATES:
-            return str(data.get("result") or data.get("result_json") or data)
+            return data
         if state in FAILURE_STATES:
-            sys.exit(f"Run failed:\n{json.dumps(data, indent=2)}")
+            sys.exit(f"Turn failed:\n{json.dumps(data, indent=2)}")
         time.sleep(poll_s)
     sys.exit(f"Timed out after {timeout_s}s waiting for {kickoff_id}")
 
 
-# --------------------------------------------------------------------------
+def last_assistant_reply(base: str, token: str, session_id: str,
+                         fallback: dict) -> str:
+    history = http("GET", f"{base}/chat/{session_id}/history", token)
+    for msg in reversed(history.get("messages") or []):
+        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
+        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")
+        if role == "assistant" and content:
+            return str(content)
+    return str(fallback.get("result") or fallback.get("result_json") or fallback)
+
+
+def load_session_id() -> str | None:
+    if not os.path.exists(SESSION_FILE):
+        return None
+    stored = open(SESSION_FILE).read().strip()
+    try:
+        uuid.UUID(stored)
+        return stored
+    except ValueError:
+        return None
+
+
+def save_session_id(session_id: str) -> None:
+    with open(SESSION_FILE, "w") as fh:
+        fh.write(session_id)
+
 
 def main() -> None:
     load_dotenv()
@@ -247,10 +219,10 @@ def main() -> None:
     ap.add_argument("--stt-model", default="gpt-4o-transcribe",
                     help="OpenAI transcription model (default: %(default)s; "
                          "whisper-1 also works)")
-    ap.add_argument("--show-inputs", action="store_true",
-                    help="Just print the deployment's required inputs and exit")
+    ap.add_argument("--inspect", action="store_true",
+                    help="Print GET /inspect (chat capability) and exit")
     ap.add_argument("--new-session", action="store_true",
-                    help="Start a fresh conversation (new session id)")
+                    help="Start a fresh AMP chat session")
     args = ap.parse_args()
 
     base = os.environ.get("CREWAI_DEPLOYMENT_URL", "").rstrip("/")
@@ -259,11 +231,11 @@ def main() -> None:
         ap.error("Set CREWAI_DEPLOYMENT_URL and CREWAI_DEPLOYMENT_TOKEN "
                  "(both are on your deployment's page in CrewAI AMP).")
 
-    if args.show_inputs:
-        print(json.dumps(discover_inputs(base, token), indent=2))
+    if args.inspect:
+        print(json.dumps(http("GET", f"{base}/inspect", token), indent=2))
         return
     if not args.audio:
-        ap.error("Provide an audio file (or use --show-inputs).")
+        ap.error("Provide an audio file (or use --inspect).")
 
     api_key = os.environ.get("OPENAI_API_KEY", "")
     key_file = os.path.expanduser("~/.openai-key")
@@ -273,25 +245,34 @@ def main() -> None:
         ap.error("Set OPENAI_API_KEY (or put the key in ~/.openai-key). "
                  "It is used ONLY for the transcription call.")
 
+    chat = inspect_chat(base, token)
+    if not (chat.get("conversational") and chat.get("handle_turn")):
+        sys.exit(
+            "This deployment does not expose conversational chat.\n"
+            f"GET /inspect flow.chat = {json.dumps(chat)}\n"
+            "Redeploy the conversational Flow from this repo, then retry."
+        )
+
     print(f"1) transcribing {args.audio} with {args.stt_model} ...")
     transcript = transcribe(args.audio, api_key, args.stt_model)
     print(f"   transcript: {transcript!r}")
 
-    print("2) discovering the deployment's input contract (GET /inputs) ...")
-    required = discover_inputs(base, token)
-    print(f"   required inputs: {required}")
+    sid = None if args.new_session else load_session_id()
+    if sid:
+        print(f"2) continuing session {sid}")
+    else:
+        print("2) POST /chat/start ...")
+        sid = start_session(base, token)
+        save_session_id(sid)
+        print(f"   session_id: {sid}")
 
-    continuing = os.path.exists(SESSION_FILE) and not args.new_session
-    sid = session_id(new=args.new_session)
-    print(f"   session id: {sid}"
-          + (" (continuing)" if continuing else " (new conversation)"))
-    inputs = build_inputs(required, transcript, sid)
-    print(f"3) kicking off with inputs: {json.dumps(inputs)}")
-    kickoff_id = kickoff(base, token, inputs)
+    print(f"3) POST /chat/{sid}/message ...")
+    kickoff_id = send_turn(base, token, sid, transcript)
     print(f"   kickoff_id: {kickoff_id}")
 
-    print("4) polling for the result ...")
-    answer = wait_for_answer(base, token, kickoff_id)
+    print("4) polling /status ...")
+    status = wait_for_turn(base, token, kickoff_id)
+    answer = last_assistant_reply(base, token, sid, status)
     print(f"\nanswer:\n{answer}")
 
 

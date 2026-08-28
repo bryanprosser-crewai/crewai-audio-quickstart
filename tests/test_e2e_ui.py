@@ -5,7 +5,7 @@ container is audio/ogg, which is exactly what broke the mic pre-fix).
 
 The mic test uses Firefox's fake-microphone mode (see conftest launch args),
 so it verifies the recording pipeline without audio hardware or an OpenAI
-call. Conversation tests type instead of talk — same kickoff path.
+call. Conversation tests type instead of talk — same AMP chat-turn path.
 """
 
 from __future__ import annotations

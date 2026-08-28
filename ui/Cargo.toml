@@ -1,6 +1,6 @@
 [package]
 name = "audio-quickstart-ui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -12,7 +12,6 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 gloo-net = { version = "0.6", features = ["http"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
-uuid = { version = "1", features = ["v4", "js"] }
 web-sys = { version = "0.3", features = [
     "Window", "Document", "Storage", "Navigator",
     "MediaDevices", "MediaStream", "MediaStreamConstraints",

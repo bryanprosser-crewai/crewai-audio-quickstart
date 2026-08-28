@@ -3,8 +3,8 @@
 //! Pattern: paste three values (deployment URL, deployment bearer token,
 //! OpenAI key), all persisted to localStorage and sent nowhere except to
 //! those two APIs, directly from the browser. Mic → OpenAI transcription →
-//! deployment kickoff (same session id every turn) → poll → reply, optionally
-//! spoken via the browser's speech synthesis.
+//! AMP chat (/chat/start, /chat/{id}/message, /status, /history) → reply,
+//! optionally spoken via the browser's speech synthesis.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -55,61 +55,124 @@ struct Msg {
 }
 
 // ---------------------------------------------------------------------------
-// Deployment API (kickoff → poll)
+// AMP chat API (start → message → poll → history)
 // ---------------------------------------------------------------------------
 
-async fn kickoff(
-    cfg: &Settings,
-    session_id: &str,
-    message: &str,
-) -> Result<String, String> {
-    let url = format!("{}/kickoff", cfg.deployment_url.trim_end_matches('/'));
-    // Conversational contract: reuse the SAME session id every turn. AMP
-    // overlays inputs onto persisted ConversationState keyed on `id`.
-    let body = serde_json::json!({ "inputs": { "id": session_id, "message": message } });
-    let resp = gloo_net::http::Request::post(&url)
-        .header("Authorization", &format!("Bearer {}", cfg.deployment_token))
-        .header("Content-Type", "application/json")
-        .body(body.to_string())
-        .map_err(|e| e.to_string())?
-        .send()
-        .await
-        .map_err(|e| format!("kickoff request failed: {e} (if this is a CORS error, use client/ask.py)"))?;
-    if !resp.ok() {
-        return Err(format!("kickoff HTTP {}: {}", resp.status(),
-                           resp.text().await.unwrap_or_default()));
-    }
-    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    ["kickoff_id", "id", "execution_id"]
-        .iter()
-        .find_map(|k| v.get(*k).and_then(|x| x.as_str()).map(String::from))
-        .ok_or_else(|| format!("no kickoff id in response: {v}"))
+fn cors_hint(op: &str, e: impl std::fmt::Display) -> String {
+    format!("{op} failed: {e} (if this is a CORS error, use client/ask.py)")
 }
 
-async fn poll_result(cfg: &Settings, kickoff_id: &str) -> Result<String, String> {
-    let url = format!("{}/status/{}", cfg.deployment_url.trim_end_matches('/'), kickoff_id);
+async fn authorized_json(
+    cfg: &Settings,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let url = format!("{}{path}", cfg.deployment_url.trim_end_matches('/'));
+    let mut req = match method {
+        "POST" => gloo_net::http::Request::post(&url),
+        _ => gloo_net::http::Request::get(&url),
+    };
+    req = req
+        .header("Authorization", &format!("Bearer {}", cfg.deployment_token))
+        .header("Content-Type", "application/json");
+    let built = if let Some(body) = body {
+        req.body(body.to_string()).map_err(|e| e.to_string())?
+    } else {
+        req.build().map_err(|e| e.to_string())?
+    };
+    let resp = built.send().await.map_err(|e| cors_hint(path, e))?;
+    let text = resp.text().await.unwrap_or_default();
+    if !resp.ok() {
+        return Err(format!("{path} HTTP {}: {text}", resp.status()));
+    }
+    if text.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+fn json_id(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_str()).map(String::from))
+}
+
+async fn require_chat(cfg: &Settings) -> Result<(), String> {
+    let v = authorized_json(cfg, "GET", "/inspect", None).await?;
+    let chat = v
+        .get("flow")
+        .and_then(|f| f.get("chat"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let conversational = chat.get("conversational").and_then(|x| x.as_bool()).unwrap_or(false);
+    let handle_turn = chat.get("handle_turn").and_then(|x| x.as_bool()).unwrap_or(false);
+    if conversational && handle_turn {
+        Ok(())
+    } else {
+        Err(format!(
+            "this deployment does not expose conversational chat \
+             (GET /inspect flow.chat = {chat}). Redeploy this Flow."
+        ))
+    }
+}
+
+async fn start_session(cfg: &Settings) -> Result<String, String> {
+    require_chat(cfg).await?;
+    let v = authorized_json(cfg, "POST", "/chat/start", Some(serde_json::json!({}))).await?;
+    json_id(&v, &["session_id", "id"])
+        .ok_or_else(|| format!("POST /chat/start returned no session_id: {v}"))
+}
+
+async fn send_turn(cfg: &Settings, session_id: &str, message: &str) -> Result<String, String> {
+    let path = format!("/chat/{session_id}/message");
+    let v = authorized_json(
+        cfg, "POST", &path,
+        Some(serde_json::json!({ "message": message, "stream": false })),
+    ).await?;
+    json_id(&v, &["kickoff_id", "id"])
+        .ok_or_else(|| format!("POST {path} returned no kickoff_id: {v}"))
+}
+
+async fn poll_turn(cfg: &Settings, kickoff_id: &str) -> Result<serde_json::Value, String> {
+    let path = format!("/status/{kickoff_id}");
     for _ in 0..100 {
-        let resp = gloo_net::http::Request::get(&url)
-            .header("Authorization", &format!("Bearer {}", cfg.deployment_token))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let v = authorized_json(cfg, "GET", &path, None).await?;
         let state = v.get("state").or_else(|| v.get("status"))
             .and_then(|s| s.as_str()).unwrap_or("").to_uppercase();
         match state.as_str() {
-            "SUCCESS" | "SUCCEEDED" | "COMPLETED" | "COMPLETE" | "FINISHED" => {
-                return Ok(v.get("result").and_then(|r| r.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| v.to_string()));
-            }
+            "SUCCESS" | "SUCCEEDED" | "COMPLETED" | "COMPLETE" | "FINISHED" => return Ok(v),
             "FAILED" | "FAILURE" | "ERROR" | "CANCELLED" => {
-                return Err(format!("run ended in {state}: {v}"));
+                return Err(format!("turn ended in {state}: {v}"));
             }
             _ => gloo_timers::future::TimeoutFuture::new(2_500).await,
         }
     }
-    Err("timed out waiting for the run".into())
+    Err("timed out waiting for the turn".into())
+}
+
+async fn last_assistant_reply(
+    cfg: &Settings,
+    session_id: &str,
+    fallback: &serde_json::Value,
+) -> String {
+    let path = format!("/chat/{session_id}/history");
+    if let Ok(v) = authorized_json(cfg, "GET", &path, None).await {
+        if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
+            for msg in msgs.iter().rev() {
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                if role == "assistant" {
+                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                        if !content.is_empty() {
+                            return content.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fallback.get("result").and_then(|r| r.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +239,7 @@ fn App() -> impl IntoView {
 
     let recorder: Rc<RefCell<Option<web_sys::MediaRecorder>>> = Rc::new(RefCell::new(None));
 
-    // one user turn: send text → kickoff → poll → append reply (+ speak)
+    // one user turn: start session if needed → /message → poll → history
     let send_text = move |text: String| {
         if text.trim().is_empty() || busy.get_untracked() {
             return;
@@ -189,17 +252,33 @@ fn App() -> impl IntoView {
         }
         set_msgs.update(|m| m.push(Msg { role: "user", text: text.clone() }));
         set_busy.set(true);
-        set_status.set("kicking off…".into());
-        let sid = session_id.get_untracked().unwrap_or_else(|| {
-            let fresh = uuid::Uuid::new_v4().to_string();
-            set_session_id.set(Some(fresh.clone()));
-            fresh
-        });
+        let existing = session_id.get_untracked();
         spawn_local(async move {
-            let outcome = match kickoff(&cfg, &sid, &text).await {
+            let sid = match existing {
+                Some(s) => s,
+                None => {
+                    set_status.set("starting session…".into());
+                    match start_session(&cfg).await {
+                        Ok(s) => {
+                            set_session_id.set(Some(s.clone()));
+                            s
+                        }
+                        Err(e) => {
+                            set_status.set(format!("error: {e}"));
+                            set_busy.set(false);
+                            return;
+                        }
+                    }
+                }
+            };
+            set_status.set("sending turn…".into());
+            let outcome = match send_turn(&cfg, &sid, &text).await {
                 Ok(kid) => {
                     set_status.set(format!("running ({kid})…"));
-                    poll_result(&cfg, &kid).await
+                    match poll_turn(&cfg, &kid).await {
+                        Ok(status) => Ok(last_assistant_reply(&cfg, &sid, &status).await),
+                        Err(e) => Err(e),
+                    }
                 }
                 Err(e) => Err(e),
             };

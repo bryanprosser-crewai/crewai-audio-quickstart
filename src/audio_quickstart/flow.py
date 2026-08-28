@@ -25,14 +25,10 @@ wizard) on a ConversationState subclass and persist it across turns.
     persistent volume by default).
 
 Session contract:
-    local:   flow.handle_turn(message, session_id=S)   # reuse S every turn
-    AMP:     POST /kickoff  {"inputs": {"id": S, "message": "..."}}
-             (AMP overlays inputs onto state; conversation_start hydrates
-             the turn the same way handle_turn would.)
-
-Reuse S. Do not mint a new id per turn and do not send restoreFromStateId —
-that was the previous kickoff-chain workaround. A new conversation is a
-new session id.
+    local:   flow.handle_turn(message, session_id=S)
+    AMP:     POST /chat/start → S; then POST /chat/{S}/message {"message": ...}
+             (AMP's chat worker calls handle_turn. conversation_start still
+             hydrates a raw /kickoff if something hits that path.)
 """
 
 from __future__ import annotations

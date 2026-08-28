@@ -210,14 +210,62 @@ fn js_err(e: JsValue) -> String {
     format!("{e:?}")
 }
 
-fn speak(text: &str) {
-    if let Some(w) = web_sys::window() {
-        if let Ok(synth) = w.speech_synthesis() {
-            if let Ok(utt) = web_sys::SpeechSynthesisUtterance::new_with_text(text) {
-                synth.speak(&utt);
-            }
-        }
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or_else(|| js_sys::Date::now())
+}
+
+fn fmt_ms(ms: f64) -> String {
+    if ms < 1000.0 {
+        format!("{ms:.0}ms")
+    } else {
+        format!("{:.2}s", ms / 1000.0)
     }
+}
+
+fn format_timing(stt_ms: Option<f64>, amp_ms: f64, speak_ms: Option<Result<f64, String>>) -> String {
+    let mut parts = Vec::new();
+    if let Some(ms) = stt_ms {
+        parts.push(format!("before AMP (STT) {}", fmt_ms(ms)));
+    }
+    parts.push(format!("AMP {}", fmt_ms(amp_ms)));
+    match speak_ms {
+        Some(Ok(ms)) => parts.push(format!("to audio {}", fmt_ms(ms))),
+        Some(Err(_)) => parts.push("to audio failed".into()),
+        None => {}
+    }
+    parts.join(" · ")
+}
+
+/// Speak the reply and return ms until playback actually starts (`onstart`).
+async fn speak_until_start(text: &str) -> Result<f64, String> {
+    let window = web_sys::window().ok_or_else(|| "no window".to_string())?;
+    let synth = window.speech_synthesis().map_err(js_err)?;
+    let utt = Rc::new(
+        web_sys::SpeechSynthesisUtterance::new_with_text(text).map_err(js_err)?,
+    );
+    let t0 = now_ms();
+    let promise = js_sys::Promise::new(&mut |resolve, reject| {
+        let utt = utt.clone();
+        let resolve = resolve.clone();
+        let on_start = Closure::<dyn FnMut()>::once(move || {
+            let _ = resolve.call1(&JsValue::UNDEFINED, &JsValue::from_f64(now_ms() - t0));
+        });
+        utt.set_onstart(Some(on_start.as_ref().unchecked_ref()));
+        on_start.forget();
+
+        let on_error = Closure::<dyn FnMut()>::once(move || {
+            let _ = reject.call1(&JsValue::UNDEFINED, &JsValue::from_str("speech synthesis error"));
+        });
+        utt.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+        on_error.forget();
+
+        synth.speak(&utt);
+    });
+    let value = JsFuture::from(promise).await.map_err(js_err)?;
+    value.as_f64().ok_or_else(|| "speech start returned no time".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -236,11 +284,12 @@ fn App() -> impl IntoView {
     let (recording, set_recording) = signal(false);
     let (draft, set_draft) = signal(String::new());
     let (show_settings, set_show_settings) = signal(!configured);
+    let (timing, set_timing) = signal(String::new());
 
     let recorder: Rc<RefCell<Option<web_sys::MediaRecorder>>> = Rc::new(RefCell::new(None));
 
     // one user turn: start session if needed → /message → poll → history
-    let send_text = move |text: String| {
+    let send_text = move |text: String, stt_ms: Option<f64>| {
         if text.trim().is_empty() || busy.get_untracked() {
             return;
         }
@@ -252,8 +301,10 @@ fn App() -> impl IntoView {
         }
         set_msgs.update(|m| m.push(Msg { role: "user", text: text.clone() }));
         set_busy.set(true);
+        set_timing.set(String::new());
         let existing = session_id.get_untracked();
         spawn_local(async move {
+            let amp_t0 = now_ms();
             let sid = match existing {
                 Some(s) => s,
                 None => {
@@ -282,15 +333,23 @@ fn App() -> impl IntoView {
                 }
                 Err(e) => Err(e),
             };
+            let amp_ms = now_ms() - amp_t0;
             match outcome {
                 Ok(reply) => {
-                    if cfg.speak_replies {
-                        speak(&reply);
-                    }
+                    let speak_ms = if cfg.speak_replies {
+                        set_status.set("speaking…".into());
+                        Some(speak_until_start(&reply).await)
+                    } else {
+                        None
+                    };
+                    set_timing.set(format_timing(stt_ms, amp_ms, speak_ms));
                     set_msgs.update(|m| m.push(Msg { role: "assistant", text: reply }));
                     set_status.set(String::new());
                 }
-                Err(e) => set_status.set(format!("error: {e}")),
+                Err(e) => {
+                    set_timing.set(format_timing(stt_ms, amp_ms, None));
+                    set_status.set(format!("error: {e}"));
+                }
             }
             set_busy.set(false);
         });
@@ -402,10 +461,12 @@ fn App() -> impl IntoView {
                 let cfg2 = settings.get_untracked();
                 set_status.set("transcribing…".into());
                 spawn_local(async move {
+                    let stt_t0 = now_ms();
                     match transcribe(&cfg2, blob, filename).await {
                         Ok(text) if !text.is_empty() => {
+                            let stt_ms = now_ms() - stt_t0;
                             set_status.set(String::new());
-                            send_text(text);
+                            send_text(text, Some(stt_ms));
                         }
                         Ok(_) => set_status.set("heard nothing — try again".into()),
                         Err(e) => set_status.set(format!("error: {e}")),
@@ -428,7 +489,7 @@ fn App() -> impl IntoView {
     let submit_draft = move |_| {
         let text = draft.get_untracked();
         set_draft.set(String::new());
-        send_text(text);
+        send_text(text, None);
     };
 
     view! {
@@ -480,6 +541,9 @@ fn App() -> impl IntoView {
                          } />
                 </div>
                 <p class="status">{move || status.get()}</p>
+                <p class="timing" class:hidden=move || timing.get().is_empty()>
+                    {move || timing.get()}
+                </p>
                 <div class="row">
                     <input type="text" placeholder="type a message — or use the mic"
                         prop:value=move || draft.get()
@@ -488,7 +552,7 @@ fn App() -> impl IntoView {
                             if ev.key() == "Enter" {
                                 let text = draft.get_untracked();
                                 set_draft.set(String::new());
-                                send_text(text);
+                                send_text(text, None);
                             }
                         } />
                     <button disabled=move || busy.get() on:click=submit_draft>"Send"</button>
@@ -504,6 +568,7 @@ fn App() -> impl IntoView {
                     <button class="ghost" on:click=move |_| {
                         set_session_id.set(None);
                         set_msgs.set(Vec::new());
+                        set_timing.set(String::new());
                         set_status.set("new conversation started".into());
                     }>"new conversation"</button>
                 </p>

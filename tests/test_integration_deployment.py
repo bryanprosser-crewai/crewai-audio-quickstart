@@ -1,8 +1,7 @@
 """Integration tier — real kickoffs against the deployed flow (needs .env).
 
-Exercises the wire contract the clients depend on: single-turn answers and
-cross-kickoff session continuity via the restoreFromStateId chain (fresh
-UUID per turn; the platform deprecates inputs.id reuse).
+Exercises the AMP chat contract the clients depend on: single-turn answers
+and cross-turn continuity via POST /chat/start + /chat/{id}/message.
 """
 
 from __future__ import annotations
@@ -29,19 +28,29 @@ def test_single_turn_answers_from_data(deployment):
     assert "UNITS" in up
 
 
-def test_restore_chain_carries_context(deployment):
-    t1, _ = run_turn(deployment, "What is the latest output reading for PUMP A1?")
-    t2, reply2 = run_turn(deployment, "And what about its energy use?",
-                          restore_from=t1)
+def test_session_id_carries_context(deployment):
+    sid, _ = run_turn(deployment, "What is the latest output reading for PUMP A1?")
+    _, reply2 = run_turn(deployment, "And what about its energy use?",
+                         session_id=sid)
     up2 = reply2.upper()
     assert "PUMP A1" in up2.replace("-", " "), \
-        "turn 2 must resolve the pronoun from restored turn-1 history"
+        "turn 2 must resolve the pronoun from session history"
     assert "KWH" in up2
 
-    _, reply3 = run_turn(deployment, "And its runtime hours?", restore_from=t2)
+    _, reply3 = run_turn(deployment, "And its runtime hours?", session_id=sid)
     up3 = reply3.upper()
     assert "PUMP A1" in up3.replace("-", " "), \
-        "state written during a fork run must itself be restorable"
+        "later turns on the same session id must still see the history"
+
+
+def test_form_wizard_continues_on_same_session(deployment):
+    sid, reply1 = run_turn(deployment, "I'd like to file a maintenance report.")
+    assert "asset" in reply1.lower()
+    _, reply2 = run_turn(deployment, "PUMP A1", session_id=sid)
+    lowered = reply2.lower()
+    assert "form cancelled" not in lowered
+    assert "kwh" not in lowered, "turn 2 must stay in the form, not re-route to asset data"
+    assert any(token in lowered for token in ("work", "done", "asset", "pump a1"))
 
 
 def test_deterministic_turn_no_llm(deployment):
